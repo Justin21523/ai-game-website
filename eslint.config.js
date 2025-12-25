@@ -4,7 +4,24 @@ import reactHooks from 'eslint-plugin-react-hooks'
 import reactRefresh from 'eslint-plugin-react-refresh'
 
 export default [
-  { ignores: ['dist'] },
+  {
+    // Ignore build output and any top-level "exported" snapshot files.
+    // These root files are not part of the Vite/React source tree and may contain
+    // concatenated snippets that are not valid ES modules (causing parse errors).
+    ignores: [
+      'dist',
+      'ai.js',
+      'BattleScene.js',
+      'Fighter.js',
+      'createPhaserGame.js',
+      'debug.js',
+      'input.js',
+      'moves.js',
+      'page.jsx',
+      'stage.js',
+      'benchmarkStorage.js',
+    ],
+  },
   {
     files: ['**/*.{js,jsx}'],
     languageOptions: {
