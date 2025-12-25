@@ -191,7 +191,16 @@ function recoverToStage(ctx) {
   ctx.intent.moveX = Math.abs(dx) > 8 ? Math.sign(dx) : 0
 
   // If we are below the "safe" zone, try to jump.
-  if (self.y > stage.height - 160) ctx.intent.jumpPressed = true
+  if (self.y > stage.height - 160) {
+    // IMPORTANT:
+    // Only request jump when grounded so we don't keep buffering jump every BT tick while airborne.
+    // Buffering + coyote time can otherwise create "pseudo double-jump" jitter.
+    maybeRequestJump(ctx, {
+      reason: 'RECOVER_JUMP',
+      requireOnGround: true,
+      cooldownMs: 260,
+    })
+  }
 
   // Avoid fast-falling while recovering.
   ctx.intent.fastFall = false
@@ -278,7 +287,13 @@ function moveToTargetX(ctx) {
   }
 
   // Jump if the target is significantly above us (simple platform-chase heuristic).
-  if (dy < -70) ctx.intent.jumpPressed = true
+  if (dy < -70) {
+    maybeRequestJump(ctx, {
+      reason: 'CHASE_JUMP',
+      requireOnGround: true,
+      cooldownMs: 260,
+    })
+  }
 
   if (ctx.reasons) ctx.reasons.push('MOVE_TO_TARGET')
 
@@ -404,8 +419,11 @@ function moveUsingPlatformGraph(ctx) {
   const goingUp = nextPlatform.top < currentPlatform.top - 8
   if (goingUp && ctx.blackboard?.self?.onGround) {
     if (Math.abs(dxToNext) < 34) {
-      ctx.intent.jumpPressed = true
-      if (ctx.reasons) ctx.reasons.push('JUMP_TO_PLATFORM')
+      maybeRequestJump(ctx, {
+        reason: 'JUMP_TO_PLATFORM',
+        requireOnGround: true,
+        cooldownMs: 260,
+      })
     }
   }
 
@@ -560,7 +578,13 @@ function approach(ctx, params) {
   const dy = desiredY - self.y
 
   ctx.intent.moveX = Math.abs(dx) > 12 ? Math.sign(dx) : 0
-  if (dy < -70) ctx.intent.jumpPressed = true
+  if (dy < -70) {
+    maybeRequestJump(ctx, {
+      reason: 'APPROACH_JUMP',
+      requireOnGround: true,
+      cooldownMs: 260,
+    })
+  }
 
   // Optional: use dash to close large gaps faster (style-dependent).
   const onGround = Boolean(ctx.blackboard?.self?.onGround)
@@ -608,10 +632,14 @@ function evade(ctx) {
   // Aggressive "jump out" when we have time (acts like a reposition rather than pure defense).
   if (onGround && timeToHitMs >= 140 && aggression >= 0.75) {
     ctx.intent.moveX = awayDir
-    ctx.intent.jumpPressed = true
+    // If jump is unavailable (cooldown), we fall back to block/dodge below.
+    const didJump = maybeRequestJump(ctx, {
+      reason: 'DEFEND_JUMP',
+      requireOnGround: true,
+      cooldownMs: 260,
+    })
     ctx.intent.fastFall = false
-    if (ctx.reasons) ctx.reasons.push('DEFEND_JUMP')
-    return BT_STATUS.SUCCESS
+    if (didJump) return BT_STATUS.SUCCESS
   }
 
   // Prefer block when grounded and the threat isn't instantaneous.
@@ -843,7 +871,13 @@ function approachAndAttack(ctx, { kind, nowMs, onGround, predictedTarget, target
   ctx.intent.moveX = absDx > 10 ? dir : 0
 
   // Jump if the target is substantially above us (simple chase heuristic).
-  if (onGround && dy < -80) ctx.intent.jumpPressed = true
+  if (onGround && dy < -80) {
+    maybeRequestJump(ctx, {
+      reason: 'ATTACK_APPROACH_JUMP',
+      requireOnGround: true,
+      cooldownMs: 240,
+    })
+  }
 
   // Dash in when far and grounded.
   // We avoid randomness; dashChance is treated as a "tendency" threshold.
@@ -963,6 +997,60 @@ function getCombatMemory(ctx) {
   }
 
   return ai.combat
+}
+
+function getMobilityMemory(ctx) {
+  // Ensure `blackboard.ai.mobility` exists and has a stable shape.
+  // This object persists across BT ticks for the same agent.
+  const ai = ctx.blackboard?.ai
+  if (!ai) return { jumpCooldownUntilMs: 0 }
+
+  if (!ai.mobility) {
+    ai.mobility = {
+      // Jump is edge-triggered, but BT ticks slower than physics.
+      // A tiny cooldown prevents repeated jump requests that can look like "twitching".
+      jumpCooldownUntilMs: 0,
+
+      // Debug helpers (optional, used by reasons/debug panel).
+      lastJumpAtMs: 0,
+      lastJumpReason: null,
+    }
+  } else {
+    // Backfill new fields on existing objects so older sessions don't crash.
+    if (ai.mobility.jumpCooldownUntilMs == null) ai.mobility.jumpCooldownUntilMs = 0
+    if (ai.mobility.lastJumpAtMs == null) ai.mobility.lastJumpAtMs = 0
+    if (ai.mobility.lastJumpReason == null) ai.mobility.lastJumpReason = null
+  }
+
+  return ai.mobility
+}
+
+function maybeRequestJump(ctx, { reason, requireOnGround = true, cooldownMs = 240 } = {}) {
+  // Centralized jump gating used by multiple leaves.
+  //
+  // Goals:
+  // - Never spam jump every tick while airborne (causes buffering jitter)
+  // - Only jump when grounded by default (platform-fighter "single jump" model)
+  // - Add a small cooldown so repeated decisions feel intentional, not twitchy
+  const nowMs = Number(ctx.nowMs ?? 0)
+  const mobility = getMobilityMemory(ctx)
+
+  if (!Number.isFinite(nowMs)) return false
+  if (nowMs < Number(mobility.jumpCooldownUntilMs ?? 0)) return false
+
+  // If the fighter is currently unable to act, don't queue more jump input.
+  if (ctx.blackboard?.self?.inHitstun || ctx.blackboard?.self?.inHitstop) return false
+
+  const onGround = Boolean(ctx.blackboard?.self?.onGround)
+  if (requireOnGround && !onGround) return false
+
+  ctx.intent.jumpPressed = true
+  mobility.jumpCooldownUntilMs = nowMs + clampNumber(Number(cooldownMs ?? 0), 0, 900)
+  mobility.lastJumpAtMs = nowMs
+  mobility.lastJumpReason = reason ? String(reason) : null
+
+  if (ctx.reasons && reason) ctx.reasons.push(String(reason))
+  return true
 }
 
 function getNavMemory(ctx) {

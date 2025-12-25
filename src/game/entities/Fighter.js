@@ -138,6 +138,16 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     // Track buffered jump request expiry time.
     this._jumpBufferedUntilMs = 0
 
+    // Track whether we already consumed a jump since the last grounded state.
+    //
+    // Why:
+    // - We support "coyote time" (jump shortly after leaving ground).
+    // - If AI (or any controller) repeatedly buffers jump while airborne,
+    //   the coyote window can incorrectly allow multiple "re-jumps" in mid-air.
+    // - This flag makes coyote time behave like a real platformer:
+    //   it helps when you *walk off* a ledge, but it does NOT create a pseudo double-jump.
+    this._hasJumpedSinceGrounded = false
+
     // Combat state.
     this._maxHp = maxHp
     this._hp = maxHp
@@ -420,6 +430,7 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     // Reset movement helpers.
     this._lastOnGroundMs = nowMs ?? 0
     this._jumpBufferedUntilMs = 0
+    this._hasJumpedSinceGrounded = false
 
     // Clear any temporary one-way collision override.
     this._ignoreOneWayUntilMs = 0
@@ -531,9 +542,33 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     const onGround = this._isOnGround()
     if (onGround) this._lastOnGroundMs = nowMs
 
+    // Reset "jump consumed" when grounded so the next airtime can jump again.
+    if (onGround) this._hasJumpedSinceGrounded = false
+
     // Detect landing (air -> ground transition) so we can apply landing lag.
     const justLanded = onGround && !this._wasOnGround
+    const justLeftGround = !onGround && this._wasOnGround
     if (justLanded) this._applyLandingLag({ nowMs })
+
+    // Debug: grounding flicker is a common root cause for jump jitter and camera shake.
+    // We only log transitions (not every frame) and we throttle to keep the console readable.
+    if (this._log.enabled && (justLanded || justLeftGround)) {
+      this._log.throttle('ground-transition', 260, () => {
+        this._log.info('ground-transition', {
+          id: this.id,
+          onGround,
+          justLanded,
+          justLeftGround,
+          x: Math.round(this.x),
+          y: Math.round(this.y),
+          vy: Math.round(Number(this.body?.velocity?.y ?? 0)),
+          blockedDown: Boolean(this.body?.blocked?.down),
+          touchingDown: Boolean(this.body?.touching?.down),
+          lastOnGroundMs: Math.round(Number(this._lastOnGroundMs ?? 0)),
+          hasJumpedSinceGrounded: Boolean(this._hasJumpedSinceGrounded),
+        })
+      })
+    }
 
     // Reset "once per airtime" resources when grounded.
     if (onGround) this._airDodgeUsed = false
@@ -828,12 +863,32 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     // Jump execution: if jump is buffered AND we are allowed to jump now, perform it.
     const jumpBuffered = nowMs <= this._jumpBufferedUntilMs
     const inCoyoteWindow = nowMs - this._lastOnGroundMs <= this._coyoteTimeMs
-    const canJump = onGround || inCoyoteWindow
+
+    // Coyote time should only allow a jump if we haven't already jumped since leaving the ground.
+    // This prevents "re-jump" jitter when jump input gets buffered repeatedly in the air.
+    const canUseCoyote = inCoyoteWindow && !this._hasJumpedSinceGrounded
+    const canJump = onGround || canUseCoyote
 
     // Guarding prevents jumping for MVP (release guard first).
     if (jumpBuffered && canJump && !this._isGuarding) {
+      const usedCoyote = !onGround && canUseCoyote
+
       this.body.setVelocityY(-this._jumpVelocity)
       this._jumpBufferedUntilMs = 0
+      this._hasJumpedSinceGrounded = true
+
+      // Debug: log jump executions so we can confirm we're not "re-jumping" in mid-air.
+      if (this._log.enabled) {
+        this._log.throttle('jump-exec', 120, () => {
+          this._log.info('jump', {
+            id: this.id,
+            usedCoyote,
+            x: Math.round(this.x),
+            y: Math.round(this.y),
+            vyAfter: Math.round(Number(this.body?.velocity?.y ?? 0)),
+          })
+        })
+      }
     }
 
     // Fast-fall: if in air and requested, force downward velocity (helps AI land quickly).
