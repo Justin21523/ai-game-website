@@ -31,9 +31,10 @@ export const MOVES = {
     hitstunMs: 220,
     hitstopMs: 50,
 
-    // Knockback applied to the victim on hit.
-    knockbackX: 420,
-    knockbackY: 320,
+	  // Knockback applied to the victim on hit.
+	  // Tuned for HP-based brawling (less "launch", more sustained scrapping).
+	  knockbackX: 320,
+	  knockbackY: 180,
 
     // Hitbox size and placement relative to the fighter.
     // X offsets are applied in the facing direction.
@@ -64,8 +65,8 @@ export const MOVES = {
     hitstunMs: 300,
     hitstopMs: 70,
 
-    knockbackX: 560,
-    knockbackY: 380,
+	  knockbackX: 440,
+	  knockbackY: 240,
 
     hitboxWidth: 86,
     hitboxHeight: 56,
@@ -90,8 +91,8 @@ export const MOVES = {
     hitstunMs: 190,
     hitstopMs: 40,
 
-    knockbackX: 320,
-    knockbackY: 240,
+	  knockbackX: 320,
+	  knockbackY: 120,
 
     hitboxWidth: 54,
     hitboxHeight: 40,
@@ -115,8 +116,8 @@ export const MOVES = {
     hitstunMs: 240,
     hitstopMs: 55,
 
-    knockbackX: 460,
-    knockbackY: 220,
+	  knockbackX: 300,
+	  knockbackY: 80,
 
     // Low hitbox: sits below the fighter center.
     hitboxWidth: 86,
@@ -141,8 +142,8 @@ export const MOVES = {
     hitstunMs: 280,
     hitstopMs: 60,
 
-    knockbackX: 360,
-    knockbackY: 520,
+	  knockbackX: 260,
+	  knockbackY: 420,
 
     // Tall hitbox: good as an anti-air.
     hitboxWidth: 58,
@@ -167,8 +168,8 @@ export const MOVES = {
     hitstunMs: 210,
     hitstopMs: 45,
 
-    knockbackX: 380,
-    knockbackY: 260,
+	  knockbackX: 280,
+	  knockbackY: 180,
 
     // Downward-leaning air hitbox.
     hitboxWidth: 66,
