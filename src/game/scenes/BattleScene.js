@@ -1144,6 +1144,12 @@ export class BattleScene extends Phaser.Scene {
     this._leftFighter.updateFighter({ nowMs, opponent: this._rightFighter })
     this._rightFighter.updateFighter({ nowMs, opponent: this._leftFighter })
 
+    // Fighter-vs-fighter "push" collision:
+    // Prevent characters from fully overlapping (which makes hits look like teleporting).
+    // We keep this as a simple horizontal separation so it feels like a platform fighter
+    // (fighters typically don't stand on top of each other like platforms).
+    this._applyFighterPushCollision({ nowMs })
+
     // Update telemetry *after* fighters update so we can detect action starts that happened this frame.
     this._updateTelemetryPerFrame({ nowMs })
 
@@ -1257,6 +1263,95 @@ export class BattleScene extends Phaser.Scene {
     if (runawayRight && spawns?.right) {
       right.setPosition(spawns.right.x, spawns.right.y)
       right.body?.setVelocity?.(0, 0)
+    }
+  }
+
+  _applyFighterPushCollision({ nowMs }) {
+    // Simple "character pushbox" implementation.
+    //
+    // Why:
+    // - Without fighter-fighter collision, AI can overlap perfectly.
+    // - That makes attacks look like instant teleports (hitbox overlaps while bodies pass through).
+    //
+    // Design:
+    // - Only push horizontally (X axis) to avoid "standing on opponent" behavior.
+    // - Apply only when fighters are at similar vertical height (to avoid air stacking).
+    const left = this._leftFighter
+    const right = this._rightFighter
+    if (!left?.body || !right?.body) return
+
+    // Approximate pushboxes using the physics body sizes (not the visual sprite).
+    const halfLeftW = Number(left.body.width ?? left.displayWidth ?? 0) / 2
+    const halfRightW = Number(right.body.width ?? right.displayWidth ?? 0) / 2
+    const halfLeftH = Number(left.body.height ?? left.displayHeight ?? 0) / 2
+    const halfRightH = Number(right.body.height ?? right.displayHeight ?? 0) / 2
+
+    // If sizes are missing, skip (defensive).
+    if (!halfLeftW || !halfRightW || !halfLeftH || !halfRightH) return
+
+    const dx = Number(right.x ?? 0) - Number(left.x ?? 0)
+    const dy = Number(right.y ?? 0) - Number(left.y ?? 0)
+
+    const overlapX = halfLeftW + halfRightW - Math.abs(dx)
+    const overlapY = halfLeftH + halfRightH - Math.abs(dy)
+    if (overlapX <= 0 || overlapY <= 0) return
+
+    // Only push when the fighters are roughly on the same "floor level".
+    // This keeps air interactions from looking like weird stacking.
+    const leftFeetY = Number(left.y ?? 0) + halfLeftH
+    const rightFeetY = Number(right.y ?? 0) + halfRightH
+    const feetDelta = Math.abs(leftFeetY - rightFeetY)
+
+    const leftOnGround = Boolean(left.body.blocked.down || left.body.touching.down)
+    const rightOnGround = Boolean(right.body.blocked.down || right.body.touching.down)
+
+    // Accept if:
+    // - both are grounded (classic push)
+    // - OR their feet are close enough (same platform, even if one is barely airborne)
+    const shouldPush = (leftOnGround && rightOnGround) || feetDelta < 22
+    if (!shouldPush) return
+
+    // Compute how far to separate each fighter.
+    // Add a tiny epsilon so they don't stay overlapping due to rounding.
+    const pushEach = overlapX / 2 + 0.6
+    const dir = dx >= 0 ? 1 : -1
+
+    // Clamp within physics bounds so we never push outside the world.
+    const bounds = this.physics?.world?.bounds
+    const minX = bounds ? Number(bounds.x ?? 0) + Math.max(halfLeftW, halfRightW) : null
+    const maxX = bounds ? Number(bounds.right ?? 0) - Math.max(halfLeftW, halfRightW) : null
+
+    const nextLeftX = Number(left.x ?? 0) - dir * pushEach
+    const nextRightX = Number(right.x ?? 0) + dir * pushEach
+
+    const clampedLeftX =
+      minX != null && maxX != null ? Phaser.Math.Clamp(nextLeftX, minX, maxX) : nextLeftX
+    const clampedRightX =
+      minX != null && maxX != null ? Phaser.Math.Clamp(nextRightX, minX, maxX) : nextRightX
+
+    // Apply separation. We do NOT touch Y so gravity/tiles remain the source of vertical motion.
+    left.setPosition(clampedLeftX, left.y)
+    right.setPosition(clampedRightX, right.y)
+
+    // Dampen horizontal velocity a bit to reduce "vibrating" when both keep pushing.
+    const damp = 0.35
+    left.body.setVelocityX(Number(left.body.velocity.x ?? 0) * damp)
+    right.body.setVelocityX(Number(right.body.velocity.x ?? 0) * damp)
+
+    // Optional debug log (throttled elsewhere) can use this value if needed.
+    if (this._log.enabled && this._log.verbose) {
+      this._log.throttle('fighters-push', 600, () => {
+        this._log.info('fighters:push', {
+          overlapX: Math.round(overlapX * 10) / 10,
+          overlapY: Math.round(overlapY * 10) / 10,
+          feetDelta: Math.round(feetDelta * 10) / 10,
+          leftOnGround,
+          rightOnGround,
+          leftX: Math.round(clampedLeftX),
+          rightX: Math.round(clampedRightX),
+          nowMs,
+        })
+      })
     }
   }
 
