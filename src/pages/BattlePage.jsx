@@ -6,6 +6,7 @@ import { Link } from 'react-router-dom'
 import GameHost from '../components/GameHost.jsx'
 import { BT_STORAGE_KEY } from '../game/ai/btStorage.js'
 import { REPLAY_STORAGE_KEY } from '../game/input/replayStorage.js'
+import { BENCHMARK_RUNS_STORAGE_KEY } from '../game/benchmark/benchmarkStorage.js'
 import { explainAiAgentSnapshot } from '../game/ai/explain/explainDecision.zh-TW.js'
 import { AI_PROFILE_OPTIONS } from '../game/ai/aiProfiles.js'
 import { STAGE_STYLE, STAGE_STYLE_LABEL } from '../game/stage/tileStageGenerator.js'
@@ -49,6 +50,114 @@ function clearStoredReplay() {
   } catch {
     return false
   }
+}
+
+function readStoredBenchmarkRuns() {
+  // Benchmark exports can be saved locally so you can compare AI changes over time.
+  try {
+    const text = localStorage.getItem(BENCHMARK_RUNS_STORAGE_KEY)
+    if (!text) return []
+    const parsed = JSON.parse(text)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function writeStoredBenchmarkRuns(list) {
+  try {
+    localStorage.setItem(BENCHMARK_RUNS_STORAGE_KEY, JSON.stringify(list))
+    return true
+  } catch {
+    return false
+  }
+}
+
+function getBenchmarkKindLabel(data) {
+  if (data?.kind === 'benchmarkBatch' || Array.isArray(data?.runs)) return 'Batch'
+  return 'Single'
+}
+
+function getBenchmarkSummary(data) {
+  // Normalize the exported payload into a stable, small summary object for UI display.
+  const report = data?.report ?? null
+  const aiProfiles = data?.aiProfiles ?? {}
+  const btHash = data?.bt?.hash ?? null
+  const kind = getBenchmarkKindLabel(data)
+
+  // Stage label:
+  // - single: use stage meta when available
+  // - batch: use stageConfigTemplate if available (seed varies per run)
+  const stageStyle = data?.stage?.style ?? data?.stageConfigTemplate?.style ?? data?.stageConfig?.style ?? null
+
+  return {
+    kind,
+    btHash,
+    leftProfile: aiProfiles.left ?? null,
+    rightProfile: aiProfiles.right ?? null,
+    stageStyle,
+    totalRounds: report?.totalRounds ?? null,
+    wins: report?.wins ?? null,
+    avgKoTimeMs: report?.avgKoTimeMs ?? null,
+    avgDamageDealt: report?.avgDamageDealt ?? null,
+    avgAttacksStarted: report?.avgAttacksStarted ?? null,
+    avgHitsLanded: report?.avgHitsLanded ?? null,
+    avgBlocks: report?.avgBlocks ?? null,
+    avgDodges: report?.avgDodges ?? null,
+  }
+}
+
+function stripBenchmarkRounds(data) {
+  // Create a smaller payload by removing the per-round rows.
+  // Useful for saving to localStorage without hitting storage limits.
+  if (!data || typeof data !== 'object') return data
+
+  if (Array.isArray(data?.runs)) {
+    return {
+      ...data,
+      runs: data.runs.map((run) => ({
+        ...run,
+        rounds: [],
+      })),
+    }
+  }
+
+  return { ...data, rounds: [] }
+}
+
+function formatEpochMs(epochMs) {
+  const ms = Number(epochMs ?? 0)
+  if (!Number.isFinite(ms) || ms <= 0) return '—'
+  try {
+    return new Date(ms).toLocaleString('zh-TW')
+  } catch {
+    return String(epochMs)
+  }
+}
+
+function formatSeconds(ms) {
+  const n = Number(ms)
+  if (!Number.isFinite(n)) return '—'
+  return `${Math.round((n / 1000) * 10) / 10}s`
+}
+
+function formatNumber(n) {
+  const v = Number(n)
+  if (!Number.isFinite(v)) return '—'
+  return String(Math.round(v * 100) / 100)
+}
+
+function formatDelta(base, next, { invertBetter = false } = {}) {
+  // Invert "better" if a smaller value is better (e.g., KO time).
+  const a = Number(base)
+  const b = Number(next)
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return '—'
+  const raw = b - a
+  const sign = raw > 0 ? '+' : ''
+  const display = `${sign}${formatNumber(raw)}`
+  if (!invertBetter) return display
+  // For "smaller is better", a negative delta is "good".
+  return raw < 0 ? `${display}（更快）` : raw > 0 ? `${display}（更慢）` : display
 }
 
 function escapeCsvCell(value) {
@@ -229,6 +338,13 @@ export default function BattlePage() {
   const [benchmarkResetMatch, setBenchmarkResetMatch] = useState(true)
   const [benchmarkCommand, setBenchmarkCommand] = useState(null)
   const [benchmarkData, setBenchmarkData] = useState(null)
+
+  // Save/compare benchmark exports locally for regression testing.
+  const [savedBenchmarkRuns, setSavedBenchmarkRuns] = useState(() => readStoredBenchmarkRuns())
+  const [benchmarkSaveName, setBenchmarkSaveName] = useState('')
+  const [benchmarkSaveSummaryOnly, setBenchmarkSaveSummaryOnly] = useState(true)
+  const [baselineRunId, setBaselineRunId] = useState('')
+  const [candidateRunId, setCandidateRunId] = useState('')
 
   // Batch benchmark controls.
   const [batchSeedStart, setBatchSeedStart] = useState('')
@@ -454,6 +570,190 @@ export default function BattlePage() {
     const batchTag = seedCount != null ? `_batch_${seedCount}seeds` : ''
     const filename = `benchmark${batchTag}_${leftProfile}_vs_${rightProfile}_${btHash}_${Date.now()}.csv`
     downloadTextFile({ filename, text: benchmarkCsv, mimeType: 'text/csv;charset=utf-8' })
+  }
+
+  function saveBenchmarkRun() {
+    // Save the last exported benchmark payload into localStorage for regression comparisons.
+    if (!benchmarkData) return
+
+    const nowEpochMs = Date.now()
+    const id = `run_${nowEpochMs}_${Math.random().toString(16).slice(2, 8)}`
+
+    const summary = getBenchmarkSummary(benchmarkData)
+    const defaultName =
+      `${summary.kind} | ${summary.leftProfile ?? 'L'} vs ${summary.rightProfile ?? 'R'} | ` +
+      `BT ${summary.btHash ?? '—'} | ${summary.totalRounds ?? '—'} rounds`
+
+    const name = benchmarkSaveName.trim() || defaultName
+    const payload = benchmarkSaveSummaryOnly ? stripBenchmarkRounds(benchmarkData) : benchmarkData
+
+    // Rough size check (localStorage is typically ~5MB; keep headroom).
+    const approxChars = JSON.stringify(payload).length
+    if (approxChars > 2_500_000) {
+      alert('此匯出結果太大，建議改用「只保存 report（不含 rounds）」或降低 rounds/seeds。')
+      return
+    }
+
+    const entry = {
+      id,
+      name,
+      savedAtEpochMs: nowEpochMs,
+      summary,
+      // Store the payload so you can re-load it later (e.g., export CSV again).
+      data: payload,
+      // Remember whether rounds were stripped, so the UI can communicate limitations.
+      summaryOnly: Boolean(benchmarkSaveSummaryOnly),
+      approxChars,
+    }
+
+    const next = [entry, ...savedBenchmarkRuns].slice(0, 30)
+    setSavedBenchmarkRuns(next)
+    writeStoredBenchmarkRuns(next)
+    setBenchmarkSaveName('')
+  }
+
+  function deleteSavedRun(id) {
+    const next = savedBenchmarkRuns.filter((r) => r?.id !== id)
+    setSavedBenchmarkRuns(next)
+    writeStoredBenchmarkRuns(next)
+  }
+
+  function clearSavedRuns() {
+    setSavedBenchmarkRuns([])
+    writeStoredBenchmarkRuns([])
+    setBaselineRunId('')
+    setCandidateRunId('')
+  }
+
+  function loadSavedRunIntoExport(id) {
+    const entry = savedBenchmarkRuns.find((r) => r?.id === id)
+    if (!entry?.data) return
+    setBenchmarkData(entry.data)
+  }
+
+  const baselineEntry = savedBenchmarkRuns.find((r) => r?.id === baselineRunId) ?? null
+  const candidateEntry = savedBenchmarkRuns.find((r) => r?.id === candidateRunId) ?? null
+
+  const comparisonText = useMemo(() => {
+    if (!baselineEntry || !candidateEntry) return ''
+
+    const a = baselineEntry.summary ?? getBenchmarkSummary(baselineEntry.data)
+    const b = candidateEntry.summary ?? getBenchmarkSummary(candidateEntry.data)
+
+    const lines = []
+    lines.push(`Baseline：${baselineEntry.name}`)
+    lines.push(`- 時間：${formatEpochMs(baselineEntry.savedAtEpochMs)}`)
+    lines.push(`- 類型：${a.kind}  | BT：${a.btHash ?? '—'}  | Profiles：${a.leftProfile ?? '—'} vs ${a.rightProfile ?? '—'}`)
+    lines.push('')
+    lines.push(`Candidate：${candidateEntry.name}`)
+    lines.push(`- 時間：${formatEpochMs(candidateEntry.savedAtEpochMs)}`)
+    lines.push(`- 類型：${b.kind}  | BT：${b.btHash ?? '—'}  | Profiles：${b.leftProfile ?? '—'} vs ${b.rightProfile ?? '—'}`)
+    lines.push('')
+
+    lines.push(`總回合：${a.totalRounds ?? '—'} → ${b.totalRounds ?? '—'}（Δ ${formatDelta(a.totalRounds, b.totalRounds)}）`)
+    lines.push(
+      `平均 KO：${formatSeconds(a.avgKoTimeMs)} → ${formatSeconds(b.avgKoTimeMs)}（Δ ${formatDelta(a.avgKoTimeMs, b.avgKoTimeMs, { invertBetter: true })}）`,
+    )
+
+    const aWins = a.wins ?? {}
+    const bWins = b.wins ?? {}
+    lines.push(
+      `勝率（count）：L ${aWins.left ?? '—'} / R ${aWins.right ?? '—'} / D ${aWins.draw ?? '—'}  →  ` +
+        `L ${bWins.left ?? '—'} / R ${bWins.right ?? '—'} / D ${bWins.draw ?? '—'}`,
+    )
+
+    lines.push(
+      `平均傷害：L ${formatNumber(a.avgDamageDealt?.left)} / R ${formatNumber(a.avgDamageDealt?.right)}  →  ` +
+        `L ${formatNumber(b.avgDamageDealt?.left)} / R ${formatNumber(b.avgDamageDealt?.right)}`,
+    )
+    lines.push(
+      `平均命中：L ${formatNumber(a.avgHitsLanded?.left)} / R ${formatNumber(a.avgHitsLanded?.right)}  →  ` +
+        `L ${formatNumber(b.avgHitsLanded?.left)} / R ${formatNumber(b.avgHitsLanded?.right)}`,
+    )
+    lines.push(
+      `平均出招數：L ${formatNumber(a.avgAttacksStarted?.left)} / R ${formatNumber(a.avgAttacksStarted?.right)}  →  ` +
+        `L ${formatNumber(b.avgAttacksStarted?.left)} / R ${formatNumber(b.avgAttacksStarted?.right)}`,
+    )
+    lines.push(
+      `平均格擋：L ${formatNumber(a.avgBlocks?.left)} / R ${formatNumber(a.avgBlocks?.right)}  →  ` +
+        `L ${formatNumber(b.avgBlocks?.left)} / R ${formatNumber(b.avgBlocks?.right)}`,
+    )
+    lines.push(
+      `平均閃避：L ${formatNumber(a.avgDodges?.left)} / R ${formatNumber(a.avgDodges?.right)}  →  ` +
+        `L ${formatNumber(b.avgDodges?.left)} / R ${formatNumber(b.avgDodges?.right)}`,
+    )
+
+    return lines.join('\n')
+  }, [baselineEntry, candidateEntry])
+
+  const savedRunsSummaryCsv = useMemo(() => {
+    if (!savedBenchmarkRuns.length) return ''
+
+    const header = [
+      'id',
+      'name',
+      'savedAt',
+      'kind',
+      'btHash',
+      'leftProfile',
+      'rightProfile',
+      'totalRounds',
+      'avgKoTimeMs',
+      'winsLeft',
+      'winsRight',
+      'winsDraw',
+      'avgDamageLeft',
+      'avgDamageRight',
+      'summaryOnly',
+      'approxChars',
+    ]
+
+    const lines = [header.map(escapeCsvCell).join(',')]
+
+    for (const entry of savedBenchmarkRuns) {
+      const s = entry?.summary ?? getBenchmarkSummary(entry?.data)
+      lines.push(
+        [
+          entry?.id ?? '',
+          entry?.name ?? '',
+          formatEpochMs(entry?.savedAtEpochMs),
+          s?.kind ?? '',
+          s?.btHash ?? '',
+          s?.leftProfile ?? '',
+          s?.rightProfile ?? '',
+          s?.totalRounds ?? '',
+          s?.avgKoTimeMs ?? '',
+          s?.wins?.left ?? '',
+          s?.wins?.right ?? '',
+          s?.wins?.draw ?? '',
+          s?.avgDamageDealt?.left ?? '',
+          s?.avgDamageDealt?.right ?? '',
+          entry?.summaryOnly ? '1' : '0',
+          entry?.approxChars ?? '',
+        ].map(escapeCsvCell).join(','),
+      )
+    }
+
+    return lines.join('\n')
+  }, [savedBenchmarkRuns])
+
+  function downloadSavedRunsSummaryCsv() {
+    if (!savedRunsSummaryCsv) return
+    downloadTextFile({
+      filename: `benchmark_runs_summary_${Date.now()}.csv`,
+      text: savedRunsSummaryCsv,
+      mimeType: 'text/csv;charset=utf-8',
+    })
+  }
+
+  async function copySavedRunsSummaryCsv() {
+    if (!savedRunsSummaryCsv) return
+    try {
+      await navigator.clipboard.writeText(savedRunsSummaryCsv)
+      alert('已複製 saved runs summary CSV 到剪貼簿。')
+    } catch {
+      alert('複製失敗：瀏覽器不允許 clipboard 存取。')
+    }
   }
 
   return (
@@ -952,6 +1252,129 @@ export default function BattlePage() {
               <pre className="codeBlock">{benchmarkCsv}</pre>
             </details>
           ) : null}
+        </div>
+
+        <div className="controlGroup" style={{ marginBottom: 16 }}>
+          <h3 className="cardTitle">回歸（保存 / 比較 Benchmark）</h3>
+          <p className="hint">
+            把「匯出 JSON」的結果保存到 localStorage，之後可以挑兩個 run 做差異比較（BT / profiles / 平均 KO 等）。
+          </p>
+
+          <div className="buttonRow" style={{ marginTop: 10 }}>
+            <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              名稱（可留空＝自動生成）
+              <input
+                className="input"
+                style={{ width: 360 }}
+                value={benchmarkSaveName}
+                onChange={(event) => setBenchmarkSaveName(event.target.value)}
+                placeholder="例如：BT v3 + aggressive buff"
+              />
+            </label>
+
+            <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                checked={benchmarkSaveSummaryOnly}
+                onChange={(event) => setBenchmarkSaveSummaryOnly(event.target.checked)}
+              />
+              只保存 report（不含 rounds，較省空間）
+            </label>
+          </div>
+
+          <div className="buttonRow" style={{ marginTop: 10 }}>
+            <button className="button" type="button" onClick={saveBenchmarkRun} disabled={!benchmarkData}>
+              保存目前匯出結果
+            </button>
+            <button className="button buttonSecondary" type="button" onClick={clearSavedRuns} disabled={!savedBenchmarkRuns.length}>
+              清空全部
+            </button>
+            <button className="button buttonSecondary" type="button" onClick={downloadSavedRunsSummaryCsv} disabled={!savedRunsSummaryCsv}>
+              下載 runs summary CSV
+            </button>
+            <button className="button buttonSecondary" type="button" onClick={copySavedRunsSummaryCsv} disabled={!savedRunsSummaryCsv}>
+              複製 runs summary CSV
+            </button>
+          </div>
+
+          <p className="hint" style={{ marginTop: 10 }}>
+            已保存：{savedBenchmarkRuns.length} 筆（localStorage key：{BENCHMARK_RUNS_STORAGE_KEY}）
+          </p>
+
+          {savedBenchmarkRuns.length ? (
+            <details style={{ marginTop: 10 }}>
+              <summary className="hint">顯示 saved runs 清單</summary>
+              <div className="controlPanel" style={{ marginTop: 10 }}>
+                {savedBenchmarkRuns.map((entry) => {
+                  const s = entry?.summary ?? getBenchmarkSummary(entry?.data)
+                  return (
+                    <div key={entry.id} style={{ padding: '8px 0', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+                      <p className="hint" style={{ margin: 0 }}>
+                        {entry.name}
+                      </p>
+                      <p className="hint" style={{ margin: '6px 0 0 0' }}>
+                        {formatEpochMs(entry.savedAtEpochMs)} | {s.kind} | BT {s.btHash ?? '—'} | {s.leftProfile ?? '—'} vs{' '}
+                        {s.rightProfile ?? '—'} | rounds {s.totalRounds ?? '—'} | avg KO {formatSeconds(s.avgKoTimeMs)}{' '}
+                        {entry.summaryOnly ? '（summary only）' : ''}
+                      </p>
+                      <div className="buttonRow" style={{ marginTop: 8 }}>
+                        <button className="button buttonSecondary" type="button" onClick={() => loadSavedRunIntoExport(entry.id)}>
+                          載入
+                        </button>
+                        <button className="button buttonSecondary" type="button" onClick={() => setBaselineRunId(entry.id)}>
+                          設為 Baseline
+                        </button>
+                        <button className="button buttonSecondary" type="button" onClick={() => setCandidateRunId(entry.id)}>
+                          設為 Candidate
+                        </button>
+                        <button className="button buttonSecondary" type="button" onClick={() => deleteSavedRun(entry.id)}>
+                          刪除
+                        </button>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </details>
+          ) : null}
+
+          <div className="controlPanel" style={{ marginTop: 12 }}>
+            <div className="buttonRow">
+              <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                Baseline
+                <select className="select" value={baselineRunId} onChange={(e) => setBaselineRunId(e.target.value)}>
+                  <option value="">（未選擇）</option>
+                  {savedBenchmarkRuns.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                Candidate
+                <select className="select" value={candidateRunId} onChange={(e) => setCandidateRunId(e.target.value)}>
+                  <option value="">（未選擇）</option>
+                  {savedBenchmarkRuns.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            {comparisonText ? (
+              <pre className="codeBlock" style={{ marginTop: 10 }}>
+                {comparisonText}
+              </pre>
+            ) : (
+              <p className="hint" style={{ marginTop: 10 }}>
+                選擇 Baseline 與 Candidate 後，這裡會顯示差異比較。
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="gameLayout">
