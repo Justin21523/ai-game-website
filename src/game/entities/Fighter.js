@@ -11,6 +11,36 @@ import { getMoveTotalMs, MOVES } from '../combat/moves.js'
 import { getAnimKey, getDefaultIdleFrameKey } from '../assets/playerCharacters.js'
 import { createDebugLogger } from '../debug/debugLogger.js'
 
+// ---- Hit-confirm / combo helpers (MVP) ----
+//
+// We add a very small "on-hit cancel" system so fighters can do short strings like:
+// - jab -> sweep
+// - light -> heavy
+//
+// This makes AI-vs-AI matches feel more like a fighting game without implementing
+// a full cancel/state system.
+const HIT_CANCEL_CHAIN = {
+  // Fast poke chains.
+  jab: ['jab', 'light', 'sweep', 'heavy'],
+  light: ['sweep', 'heavy', 'uppercut'],
+
+  // Low -> finisher.
+  sweep: ['heavy'],
+
+  // Air strings (limited).
+  airKick: ['light'],
+
+  // Heavy/uppercut are commits (no cancels).
+  heavy: [],
+  uppercut: [],
+}
+
+// Safety limits:
+// - Prevent infinite jab loops
+// - Keep combos readable for a learning-focused prototype
+const MAX_COMBO_CHAIN_COUNT = 3
+const COMBO_RESET_WINDOW_MS = 900
+
 // Simple enums used by the fighter state machine.
 export const ATTACK_PHASE = {
   STARTUP: 'startup',
@@ -115,6 +145,17 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     // Track recent impacts for debug/explainability.
     // This is not used for gameplay logic directly.
     this._lastImpact = null
+
+    // Track the last attack outcome ("hit-confirm") for AI + debug tooling.
+    // Set by BattleScene hit resolution via `noteAttackEvent(...)`.
+    this._lastAttackEvent = null
+
+    // Combo bookkeeping (attacker-side only).
+    // `comboChainCount` increments on each landed hit, then resets after a short gap.
+    // `hitCancel` opens a brief window where we can cancel recovery into a follow-up.
+    this._comboChainCount = 0
+    this._lastLandedHitAtMs = 0
+    this._hitCancel = null
 
     // Hitstun: while active, the fighter cannot act (movement/attacks).
     this._hitstunUntilMs = 0
@@ -325,6 +366,12 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     return this._attack
   }
 
+  getLastAttackEvent() {
+    // Last "attack outcome" as recorded by BattleScene.
+    // Shape: { outcome, kind, targetId, damageDealt, hitstunMs, atMs }
+    return this._lastAttackEvent
+  }
+
   isGuarding() {
     // Guard state is updated every frame in updateFighter().
     // Consumers (BattleScene hit resolution, AI) use this as a cheap query.
@@ -361,6 +408,10 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     this._attack = null
     this._attackCooldownUntilMs = 0
     this._lastImpact = null
+    this._lastAttackEvent = null
+    this._comboChainCount = 0
+    this._lastLandedHitAtMs = 0
+    this._hitCancel = null
 
     // Reset movement helpers.
     this._lastOnGroundMs = nowMs ?? 0
@@ -573,15 +624,23 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
   // ---- Combat helpers ----
 
   canAttack(kind, nowMs, onGround) {
-    // You cannot attack during hitstun/hitstop, while already attacking, or during cooldown.
+    // You cannot attack during hitstun/hitstop or during cooldown.
+    // Exception: a valid hit-cancel can start a follow-up during recovery.
     if (nowMs < this._hitstunUntilMs) return false
     if (nowMs < this._hitstopUntilMs) return false
     if (this.isActionLocked(nowMs)) return false
     if (this.isDodging(nowMs)) return false
     if (this.isDashing(nowMs)) return false
     if (this._isGuarding) return false
-    if (this._attack) return false
-    if (nowMs < this._attackCooldownUntilMs) return false
+
+    // Hit-cancel: allow canceling a recovery into another move (small combo system).
+    const canCancel = this._canCancelAttackInto(kind, nowMs, onGround)
+
+    // If we are mid-attack, only allow starting a new move via a valid cancel.
+    if (this._attack && !canCancel) return false
+
+    // If we're not canceling, obey global cooldown.
+    if (!canCancel && nowMs < this._attackCooldownUntilMs) return false
 
     // The move kind must exist.
     const move = MOVES[kind]
@@ -622,6 +681,7 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
 
     // Cancel any current attack on hit (common in fighting games).
     this._attack = null
+    this._hitCancel = null
 
     // Getting hit cancels mobility commitments (dash/dodge) and landing locks.
     // This keeps state transitions easier to reason about for MVP.
@@ -637,6 +697,52 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
 
     // Store the last impact so debug UI can show what happened recently.
     this._lastImpact = { kind: String(impactKind ?? 'hit'), atMs: nowMs ?? 0 }
+  }
+
+  noteAttackEvent({ outcome, kind, targetId, damageDealt, hitstunMs, nowMs } = {}) {
+    // Called by BattleScene when one of our attacks connects (hit/block).
+    //
+    // This is the key "hit-confirm" signal:
+    // - AI can choose a combo follow-up only when it *actually* hit.
+    // - Later, a UI panel can show "your last move was blocked" for learning.
+    const atMs = Number(nowMs ?? 0)
+    const safeOutcome = String(outcome ?? 'unknown')
+    const safeKind = kind != null ? String(kind) : this._attack?.kind ? String(this._attack.kind) : null
+
+    this._lastAttackEvent = {
+      outcome: safeOutcome,
+      kind: safeKind,
+      targetId: targetId != null ? String(targetId) : null,
+      damageDealt: Number.isFinite(damageDealt) ? Math.max(0, Number(damageDealt)) : 0,
+      hitstunMs: Number.isFinite(hitstunMs) ? Math.max(0, Number(hitstunMs)) : 0,
+      atMs,
+    }
+
+    // Only open a cancel window on true hits (not blocks).
+    if (safeOutcome !== 'hit') return
+
+    // Reset chain counter if we haven't hit anything recently.
+    if (atMs - Number(this._lastLandedHitAtMs ?? 0) > COMBO_RESET_WINDOW_MS) {
+      this._comboChainCount = 0
+    }
+
+    this._comboChainCount = Math.min(MAX_COMBO_CHAIN_COUNT, Number(this._comboChainCount ?? 0) + 1)
+    this._lastLandedHitAtMs = atMs
+
+    // Cancel window length:
+    // - Based on victim hitstun (more hitstun => more time to choose a follow-up)
+    // - Clamped so cancels never feel late/unclear
+    const baseHitstun = Number.isFinite(hitstunMs) ? Number(hitstunMs) : 0
+    const windowMs = clampNumber(baseHitstun * 0.55, 140, 420)
+
+    this._hitCancel = {
+      // Window is time-based (Phaser clock ms) for determinism.
+      untilMs: atMs + windowMs,
+      // Store the move we hit with (used to validate cancel chains).
+      fromKind: safeKind,
+      // How deep we are in the current chain (safety cap).
+      chainCount: this._comboChainCount,
+    }
   }
 
   // Returns a hurtbox rectangle in world coordinates.
@@ -855,7 +961,9 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
   // ---- Internal attack methods ----
 
   _tryStartAttack({ kind, nowMs, onGround }) {
-    if (!this.canAttack(kind, nowMs)) return
+    // Determine whether we are starting this move as a hit-cancel follow-up.
+    const willCancel = this._canCancelAttackInto(kind, nowMs, onGround)
+    if (!this.canAttack(kind, nowMs, onGround)) return
 
     const move = MOVES[kind]
     if (!move) return
@@ -866,6 +974,14 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     const allowAir = move.allowedAir !== false
     if (onGround && !allowGround) return
     if (!onGround && !allowAir) return
+
+    if (willCancel) {
+      // Cancel the current move and clear its cancel window.
+      // The new move starts a fresh state machine (startup/active/recovery).
+      this._attack = null
+      this._hitCancel = null
+      this._attackCooldownUntilMs = 0
+    }
 
     // Enter startup phase.
     this._attack = {
@@ -902,6 +1018,7 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     const move = MOVES[this._attack.kind]
     if (!move) {
       this._attack = null
+      this._hitCancel = null
       return
     }
 
@@ -920,6 +1037,43 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
 
     // End of recovery: attack is finished.
     this._attack = null
+    this._hitCancel = null
+  }
+
+  _canCancelAttackInto(kind, nowMs, onGround) {
+    // Internal rule check for our simplified "on-hit cancel" system.
+    //
+    // Conservative rules (MVP):
+    // - Only during RECOVERY (no active-frame cancels yet)
+    // - Only after the move already hit
+    // - Only within a short time window after the hit-confirm event
+    if (!this._attack) return false
+    if (!this._hitCancel) return false
+
+    // Only allow canceling out of recovery frames.
+    if (this._attack.phase !== ATTACK_PHASE.RECOVERY) return false
+
+    // Only after we actually connected.
+    if (!this._attack.hasHit) return false
+
+    const atMs = Number(nowMs ?? 0)
+    if (atMs > Number(this._hitCancel.untilMs ?? 0)) return false
+
+    // Respect safety cap.
+    const chainCount = Number(this._hitCancel.chainCount ?? 0)
+    if (chainCount >= MAX_COMBO_CHAIN_COUNT) return false
+
+    // The follow-up move must exist and be usable in the current air/ground state.
+    const move = MOVES[kind]
+    if (!move) return false
+    if (typeof onGround === 'boolean') {
+      if (onGround && move.allowedGround === false) return false
+      if (!onGround && move.allowedAir === false) return false
+    }
+
+    const fromKind = String(this._attack.kind ?? '')
+    const allowedNext = HIT_CANCEL_CHAIN[fromKind] ?? []
+    return allowedNext.includes(String(kind))
   }
 
   // ---- Visual sprite helpers ----

@@ -1303,6 +1303,8 @@ export class BattleScene extends Phaser.Scene {
       invincible: typeof fighter.isInvincible === 'function' ? fighter.isInvincible(nowMs) : false,
       actionLocked: typeof fighter.isActionLocked === 'function' ? fighter.isActionLocked(nowMs) : false,
       lastImpact: fighter._lastImpact ?? null,
+      lastAttackEvent:
+        typeof fighter.getLastAttackEvent === 'function' ? fighter.getLastAttackEvent() : null,
       render: {
         body: {
           visible: Boolean(fighter.visible),
@@ -1479,12 +1481,26 @@ export class BattleScene extends Phaser.Scene {
         impactKind: 'block',
       })
 
+      const hpAfter = defender.hp
+      const actualDamage = Math.max(0, Number(hpBefore ?? 0) - Number(hpAfter ?? 0))
+
       // Telemetry: record actual damage dealt (chip).
       if (this._telemetry && attackerSide && defenderSide) {
-        const hpAfter = defender.hp
-        const actualDamage = Math.max(0, Number(hpBefore ?? 0) - Number(hpAfter ?? 0))
         this._telemetry.round[attackerSide].damageDealt += actualDamage
         this._telemetry.round[attackerSide].chipDamageDealt += actualDamage
+      }
+
+      // Hit-confirm signal for the attacker (blocked).
+      // This lets AI distinguish "I hit" vs "I got blocked".
+      if (typeof attacker?.noteAttackEvent === 'function') {
+        attacker.noteAttackEvent({
+          outcome: 'blocked',
+          kind: move.kind,
+          targetId: defender.id,
+          damageDealt: actualDamage,
+          hitstunMs: blockstunMs,
+          nowMs,
+        })
       }
 
       // Optional: small attacker recoil for readability (feels more like a fighting game).
@@ -1515,11 +1531,24 @@ export class BattleScene extends Phaser.Scene {
       impactKind: 'hit',
     })
 
+    const hpAfter = defender.hp
+    const actualDamage = Math.max(0, Number(hpBefore ?? 0) - Number(hpAfter ?? 0))
+
     // Telemetry: record actual damage dealt (may be less than move.damage when HP was low).
     if (this._telemetry && attackerSide && defenderSide) {
-      const hpAfter = defender.hp
-      const actualDamage = Math.max(0, Number(hpBefore ?? 0) - Number(hpAfter ?? 0))
       this._telemetry.round[attackerSide].damageDealt += actualDamage
+    }
+
+    // Hit-confirm signal for the attacker (landed hit).
+    if (typeof attacker?.noteAttackEvent === 'function') {
+      attacker.noteAttackEvent({
+        outcome: 'hit',
+        kind: move.kind,
+        targetId: defender.id,
+        damageDealt: actualDamage,
+        hitstunMs: move.hitstunMs,
+        nowMs,
+      })
     }
   }
 
