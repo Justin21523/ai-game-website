@@ -10,6 +10,7 @@ import { BENCHMARK_RUNS_STORAGE_KEY } from '../game/benchmark/benchmarkStorage.j
 import { explainAiAgentSnapshot } from '../game/ai/explain/explainDecision.zh-TW.js'
 import { AI_PROFILE_OPTIONS } from '../game/ai/aiProfiles.js'
 import { STAGE_STYLE, STAGE_STYLE_LABEL } from '../game/stage/tileStageGenerator.js'
+import { getGameDebugConfig } from '../game/debug/debugConfig.js'
 
 // Read the BT JSON saved by the BT lab page.
 // Safely read a string value from localStorage.
@@ -294,6 +295,10 @@ function downloadTextFile({ filename, text, mimeType } = {}) {
 }
 
 export default function BattlePage() {
+  // Force-remount token for Phaser.
+  // This is useful when changing debug logging settings that are read during game creation.
+  const [gameHostKey, setGameHostKey] = useState(0)
+
   // Read the saved BT JSON once when the page renders.
   // If none exists, GameHost will pass null and the scene can fall back to defaults.
   const btJsonText = useMemo(() => readStoredBtJson(), [])
@@ -374,6 +379,26 @@ export default function BattlePage() {
   const handleDebugSnapshot = useCallback((snapshot) => {
     setDebugSnapshot(snapshot)
   }, [])
+
+  // Read the current debug config (query string + localStorage).
+  // This controls whether createDebugLogger emits console output.
+  const debugConfig = getGameDebugConfig()
+
+  function setDebugLogging({ enabled, verbose } = {}) {
+    // This UI helper writes localStorage flags used by `getGameDebugConfig()`.
+    // We also force-remount the Phaser game so all loggers pick up the new settings.
+    try {
+      if (typeof enabled === 'boolean') localStorage.setItem('DEBUG_GAME', enabled ? '1' : '0')
+      if (typeof verbose === 'boolean') {
+        localStorage.setItem('DEBUG_GAME_VERBOSE', verbose ? '1' : '0')
+      }
+    } catch {
+      // Ignore storage failures (private mode / blocked storage).
+    }
+
+    // Force a full Phaser re-mount so you can immediately see console output without a page reload.
+    setGameHostKey((k) => k + 1)
+  }
 
   // Receive recorded replay data from Phaser and persist it for later reuse.
   const handleReplayData = useCallback((data) => {
@@ -1380,6 +1405,7 @@ export default function BattlePage() {
         <div className="gameLayout">
           <div>
             <GameHost
+              key={gameHostKey}
               btJsonText={btJsonText}
               controlMode={controlMode}
               aiProfiles={aiProfiles}
@@ -1398,6 +1424,49 @@ export default function BattlePage() {
           </div>
           <aside className="debugPanel">
             <h3 className="cardTitle">AI 解釋（人話）</h3>
+
+            <div style={{ marginTop: 10 }}>
+              <p className="hint" style={{ marginTop: 0 }}>
+                Console Debug：{debugConfig.enabled ? '已啟用' : '未啟用'}
+                {debugConfig.enabled && debugConfig.verbose ? '（Verbose）' : ''}
+              </p>
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 10 }}>
+                <button
+                  type="button"
+                  className="button"
+                  onClick={() => setDebugLogging({ enabled: true })}
+                >
+                  啟用 Console Log
+                </button>
+                <button
+                  type="button"
+                  className="button buttonSecondary"
+                  onClick={() => setDebugLogging({ enabled: false, verbose: false })}
+                >
+                  停用 Console Log
+                </button>
+                <button
+                  type="button"
+                  className="button buttonSecondary"
+                  disabled={!debugConfig.enabled}
+                  onClick={() =>
+                    setDebugLogging({ enabled: true, verbose: !debugConfig.verbose })
+                  }
+                >
+                  切換 Verbose
+                </button>
+                <button
+                  type="button"
+                  className="button buttonSecondary"
+                  onClick={() => setGameHostKey((k) => k + 1)}
+                >
+                  重新建立遊戲
+                </button>
+              </div>
+              <p className="hint">
+                也可用網址參數：<code>?debug=1&amp;debugVerbose=1</code>
+              </p>
+            </div>
 
             {playerAssets ? (
               <p className={playerAssets.ok ? 'statusOk' : 'statusError'}>
