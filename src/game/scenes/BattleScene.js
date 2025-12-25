@@ -2837,9 +2837,19 @@ export class BattleScene extends Phaser.Scene {
     }
 
     const finalX = applyHysteresis(currentX, clampedX, 0.75)
-    // Vertical motion is more sensitive (1px jumps are very noticeable), so we use a slightly
-    // larger threshold to suppress "ground contact" micro jitter.
-    const finalY = applyHysteresis(currentY, clampedY, 1.25)
+    // Vertical motion is more sensitive (1px jumps are very noticeable), so we suppress it more.
+    //
+    // IMPORTANT:
+    // When BOTH fighters are grounded, Arcade Physics can still micro-adjust their bodies
+    // (tile collision separation, pushboxes, world bounds). That can create 1-3px oscillation
+    // in the midpoint and looks like constant camera shake.
+    //
+    // Using a slightly larger hysteresis while grounded keeps the camera stable without
+    // affecting jump readability (air movement is much larger than this threshold).
+    const leftGrounded = Boolean(left?.body?.blocked?.down || left?.body?.touching?.down)
+    const rightGrounded = Boolean(right?.body?.blocked?.down || right?.body?.touching?.down)
+    const yThreshold = leftGrounded && rightGrounded ? 2.35 : 1.25
+    const finalY = applyHysteresis(currentY, clampedY, yThreshold)
 
     // IMPORTANT:
     // Phaser Camera (when `roundPixels` is enabled) will `Math.floor` the computed scroll values.
