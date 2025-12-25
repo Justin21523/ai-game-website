@@ -1,0 +1,220 @@
+#root {
+  min-height: 100vh;
+}
+
+.page {
+  /* Give the game canvas more horizontal room on wide screens. */
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.pageHeader {
+  margin-bottom: 16px;
+}
+
+.headerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.title {
+  margin: 0;
+  font-size: 1.75rem;
+}
+
+.subtitle {
+  margin: 8px 0 0;
+  color: rgba(255, 255, 255, 0.72);
+  max-width: 90ch;
+}
+
+.card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.cardTitle {
+  margin: 0 0 12px;
+  font-size: 1.1rem;
+}
+
+.buttonRow {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.toolbarRow {
+  margin: 0 0 16px;
+}
+
+.controlPanel {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin: 0 0 16px;
+}
+
+.controlGroup {
+  padding: 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.label {
+  display: block;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+
+.select {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.92);
+  font: inherit;
+}
+
+.input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.92);
+  font: inherit;
+}
+
+.select:focus,
+.select:focus-visible {
+  outline: 2px solid rgba(100, 108, 255, 0.75);
+  outline-offset: 2px;
+}
+
+.input:focus,
+.input:focus-visible {
+  outline: 2px solid rgba(100, 108, 255, 0.75);
+  outline-offset: 2px;
+}
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 10px;
+  padding: 10px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(100, 108, 255, 0.22);
+  color: rgba(255, 255, 255, 0.92);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.button:hover {
+  border-color: rgba(100, 108, 255, 0.9);
+}
+
+.buttonSecondary {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.hint {
+  margin: 12px 0 0;
+  color: rgba(255, 255, 255, 0.66);
+  font-size: 0.95rem;
+}
+
+.textArea {
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(0, 0, 0, 0.35);
+  color: rgba(255, 255, 255, 0.9);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    'Liberation Mono', 'Courier New', monospace;
+  line-height: 1.4;
+}
+
+.statusOk {
+  margin: 12px 0 0;
+  color: rgba(118, 255, 189, 0.9);
+}
+
+.statusError {
+  margin: 12px 0 0;
+  color: rgba(255, 132, 132, 0.9);
+}
+
+.gameLayout {
+  display: grid;
+  grid-template-columns: 1fr 320px;
+  gap: 16px;
+}
+
+.gameCanvas {
+  /* Provide a stable box for Phaser to fit into. */
+  position: relative;
+  width: 100%;
+  /* Fixed (but responsive) height prevents ScaleManager resize feedback loops. */
+  height: clamp(420px, 72vh, 900px);
+  /* Center the canvas if Phaser autoCenter is disabled or briefly not applied. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+.gameCanvas canvas {
+  /* Let Phaser ScaleManager own the inline width/height. */
+  display: block;
+}
+
+.gameCanvasPlaceholder {
+  min-height: 420px;
+  border-radius: 12px;
+  border: 1px dashed rgba(255, 255, 255, 0.18);
+  padding: 16px;
+}
+
+.debugPanel {
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03);
+  padding: 16px;
+  /* Keep the page height stable while debug JSON updates (prevents scrollbar-induced canvas resize jitter). */
+  max-height: clamp(420px, 72vh, 900px);
+  overflow: auto;
+}
+
+.codeBlock {
+  margin: 12px 0 0;
+  padding: 12px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.35);
+  overflow: auto;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 900px) {
+  .controlPanel {
+    grid-template-columns: 1fr;
+  }
+
+  .gameLayout {
+    grid-template-columns: 1fr;
+  }
+}
