@@ -2019,8 +2019,15 @@ export class BattleScene extends Phaser.Scene {
     // larger threshold to suppress "ground contact" micro jitter.
     const finalY = applyHysteresis(currentY, clampedY, 1.25)
 
-    // Keep focus position as float; camera roundPixels will handle render rounding.
-    this._cameraFocus.setPosition(finalX, finalY)
+    // IMPORTANT:
+    // Phaser Camera (when `roundPixels` is enabled) will `Math.floor` the computed scroll values.
+    // If the follow target is *close* to an integer boundary (e.g. 360.0001 vs 359.9999),
+    // the `floor` can flip the scroll by 1px every frame, which looks like constant shaking.
+    //
+    // The simplest stable fix is to snap the follow target to integer world pixels.
+    // Because our camera size is integer (1280x720) and zoom is fixed at 1,
+    // integer follow target => integer scroll => no floor-induced oscillation.
+    this._cameraFocus.setPosition(Math.round(finalX), Math.round(finalY))
 
     // Keep camera zoom fixed at 1 for stability.
     // Dynamic zoom is a common source of "shaking" because scroll changes as zoom changes.
