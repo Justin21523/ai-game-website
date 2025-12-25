@@ -12,15 +12,88 @@ import { createDebugLogger } from '../debug/debugLogger.js'
 const GAME_WIDTH = 1280
 const GAME_HEIGHT = 720
 
+// ---- React / hot-reload safety ----
+//
+// In development (React StrictMode, route transitions, hot reload), it's easy to accidentally
+// create multiple Phaser.Game instances for the same DOM parent. That can lead to:
+// - multiple canvases stacked in the same container ("flicker")
+// - multiple scenes/physics worlds running (duplicate logic, confusing behavior)
+//
+// GameHost already tries to prevent this, but we keep an extra guardrail here so
+// `createPhaserGame()` stays safe even if called more than once.
+const PB_GAME_KEY = Symbol.for('reactai-platform-brawl:phaserGame')
+
+function resolveParentElement(parent) {
+  if (!parent) return null
+  if (typeof parent !== 'string') return parent
+  try {
+    if (typeof document === 'undefined') return null
+    return document.getElementById(parent)
+  } catch {
+    return null
+  }
+}
+
+function cleanupParentCanvases(parentEl) {
+  // Remove stray canvases left behind by interrupted hot reload / failed cleanup.
+  if (!parentEl?.querySelectorAll) return
+  const canvases = parentEl.querySelectorAll('canvas')
+  for (const canvas of canvases) {
+    try {
+      canvas.remove?.()
+    } catch {
+      try {
+        parentEl.removeChild(canvas)
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+function isProbablyAlivePhaserGame(game) {
+  if (!game) return false
+  if (game.isDestroyed || game.destroyed || game.pendingDestroy) return false
+  return Boolean(game.canvas && game.events)
+}
+
 export function createPhaserGame({ parent, btJsonText, onDebugSnapshot, debug } = {}) {
   const log = createDebugLogger('PhaserGame')
+
+  const parentEl = resolveParentElement(parent) ?? parent
+
+  // Defensive: destroy any previous game bound to the same parent.
+  // This prevents multiple game loops from running if something calls createPhaserGame twice.
+  const existingGame = parentEl?.[PB_GAME_KEY]
+  if (isProbablyAlivePhaserGame(existingGame) && typeof existingGame.destroy === 'function') {
+    if (debug || log.enabled) log.warn('destroy-existing-game')
+    try {
+      existingGame.destroy(true)
+    } catch (error) {
+      if (debug || log.enabled) {
+        log.error('destroy-existing-game-failed', {
+          message: error instanceof Error ? error.message : String(error),
+        })
+      }
+    }
+  } else if (existingGame) {
+    // Clear stale references from older sessions.
+    try {
+      delete parentEl[PB_GAME_KEY]
+    } catch {
+      // ignore
+    }
+  }
+
+  // Clean up any stray canvases regardless of whether we had a stored reference.
+  cleanupParentCanvases(parentEl)
 
   // Instantiate the scene with dependencies we want to inject (BT JSON + debug callback).
   const battleScene = new BattleScene({ btJsonText, onDebugSnapshot })
 
   const config = {
     type: Phaser.AUTO,
-    parent,
+    parent: parentEl,
     width: GAME_WIDTH,
     height: GAME_HEIGHT,
     backgroundColor: '#0d1117',
@@ -55,15 +128,15 @@ export function createPhaserGame({ parent, btJsonText, onDebugSnapshot, debug } 
 
   if (debug || log.enabled) {
     // Log the initial config and parent element size.
-    const parentRect = parent?.getBoundingClientRect?.()
+    const parentRect = parentEl?.getBoundingClientRect?.()
     log.groupCollapsed('create', {
       width: GAME_WIDTH,
       height: GAME_HEIGHT,
       scaleMode: 'FIT',
       autoCenter: 'CENTER_BOTH',
       parent: {
-        clientWidth: parent?.clientWidth ?? 0,
-        clientHeight: parent?.clientHeight ?? 0,
+        clientWidth: parentEl?.clientWidth ?? 0,
+        clientHeight: parentEl?.clientHeight ?? 0,
         rect: parentRect
           ? {
               x: Math.round(parentRect.x * 10) / 10,
@@ -79,6 +152,23 @@ export function createPhaserGame({ parent, btJsonText, onDebugSnapshot, debug } 
 
   const game = new Phaser.Game(config)
 
+  // Store a reference for safety/idempotency, and clear it on destroy.
+  if (parentEl) {
+    try {
+      parentEl[PB_GAME_KEY] = game
+    } catch {
+      // ignore
+    }
+
+    game.events.once(Phaser.Core.Events.DESTROY, () => {
+      try {
+        if (parentEl[PB_GAME_KEY] === game) delete parentEl[PB_GAME_KEY]
+      } catch {
+        // ignore
+      }
+    })
+  }
+
   if (debug || log.enabled) {
     // ---- Core lifecycle ----
     const onBoot = () => log.info('BOOT')
@@ -93,10 +183,10 @@ export function createPhaserGame({ parent, btJsonText, onDebugSnapshot, debug } 
 
       // A 0-sized canvas indicates a parent layout/CSS issue (blank screen).
       if (!canvasClientWidth || !canvasClientHeight) {
-        const parentEl = game.scale?.parent ?? parent
+        const parentNode = game.scale?.parent ?? parentEl
         log.error('READY_canvas-size-zero', {
           canvasClient: { w: canvasClientWidth, h: canvasClientHeight },
-          parentClient: { w: parentEl?.clientWidth ?? 0, h: parentEl?.clientHeight ?? 0 },
+          parentClient: { w: parentNode?.clientWidth ?? 0, h: parentNode?.clientHeight ?? 0 },
         })
       }
     }
