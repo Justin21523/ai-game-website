@@ -89,6 +89,14 @@ export default function BattlePage() {
   // A command object sent to GameHost/Phaser to rebuild the stage.
   const [stageCommand, setStageCommand] = useState(null)
 
+  // ---- Benchmark (evaluation loop) ----
+  // Auto-run N rounds and collect stats so you can compare AI changes objectively.
+  const [benchmarkRounds, setBenchmarkRounds] = useState(30)
+  const [benchmarkStopOnComplete, setBenchmarkStopOnComplete] = useState(true)
+  const [benchmarkResetMatch, setBenchmarkResetMatch] = useState(true)
+  const [benchmarkCommand, setBenchmarkCommand] = useState(null)
+  const [benchmarkData, setBenchmarkData] = useState(null)
+
   // Increment this number to request a "reset match" from the running Phaser scene.
   // Using a monotonically increasing token is a simple way to trigger an effect.
   const [restartToken, setRestartToken] = useState(0)
@@ -118,6 +126,12 @@ export default function BattlePage() {
 
     setReplayData(data)
     writeStoredReplay(data)
+  }, [])
+
+  // Receive exported benchmark payload from Phaser (round rows + aggregate report).
+  const handleBenchmarkData = useCallback((data) => {
+    if (!data) return
+    setBenchmarkData(data)
   }, [])
 
   // UI helpers: send commands to Phaser via GameHost.
@@ -209,6 +223,40 @@ export default function BattlePage() {
   function randomizeSeed() {
     // Use a time-based seed for convenience (still reproducible if you copy the value).
     setStageSeed(String(Date.now()))
+  }
+
+  // Benchmark helpers: start/stop/export.
+  function startBenchmark() {
+    setBenchmarkCommand({
+      type: 'startBenchmark',
+      payload: {
+        rounds: benchmarkRounds,
+        stopOnComplete: benchmarkStopOnComplete,
+        resetMatch: benchmarkResetMatch,
+      },
+    })
+  }
+
+  function stopBenchmark() {
+    setBenchmarkCommand({ type: 'stopBenchmark', payload: {} })
+  }
+
+  function exportBenchmark() {
+    setBenchmarkCommand({ type: 'exportBenchmark', payload: {} })
+  }
+
+  async function copyBenchmarkJson() {
+    // Copy the last exported benchmark payload to clipboard.
+    // This is useful for pasting into a gist / spreadsheet / analysis script.
+    if (!benchmarkData) return
+
+    try {
+      const text = JSON.stringify(benchmarkData, null, 2)
+      await navigator.clipboard.writeText(text)
+      alert('已複製 Benchmark JSON 到剪貼簿。')
+    } catch {
+      alert('複製失敗：瀏覽器不允許 clipboard 存取。請改用「顯示 JSON」手動複製。')
+    }
   }
 
   return (
@@ -511,6 +559,93 @@ export default function BattlePage() {
           </div>
         </div>
 
+        <div className="controlGroup" style={{ marginBottom: 16 }}>
+          <h3 className="cardTitle">評測（Benchmark / 自動跑 N 回合）</h3>
+          <p className="hint">
+            用來客觀比較 AI 版本：自動跑 N 回合並統計平均 KO 時間、傷害、命中、格擋/閃避等。完成後會停在 FINISH 畫面。
+          </p>
+
+          <div className="buttonRow" style={{ marginTop: 10 }}>
+            <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              回合數
+              <input
+                className="input"
+                style={{ width: 110 }}
+                type="number"
+                min="1"
+                max="500"
+                value={benchmarkRounds}
+                onChange={(event) => setBenchmarkRounds(Number(event.target.value))}
+              />
+            </label>
+
+            <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                checked={benchmarkStopOnComplete}
+                onChange={(event) => setBenchmarkStopOnComplete(event.target.checked)}
+              />
+              完成後停住（推薦）
+            </label>
+
+            <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+              <input
+                type="checkbox"
+                checked={benchmarkResetMatch}
+                onChange={(event) => setBenchmarkResetMatch(event.target.checked)}
+              />
+              開始前重置比賽
+            </label>
+          </div>
+
+          <div className="buttonRow" style={{ marginTop: 10 }}>
+            <button className="button" type="button" onClick={startBenchmark}>
+              開始 Benchmark
+            </button>
+            <button className="button buttonSecondary" type="button" onClick={stopBenchmark}>
+              停止（恢復比賽）
+            </button>
+            <button className="button buttonSecondary" type="button" onClick={exportBenchmark}>
+              匯出 Benchmark JSON
+            </button>
+            <button
+              className="button buttonSecondary"
+              type="button"
+              onClick={copyBenchmarkJson}
+              disabled={!benchmarkData}
+            >
+              複製 JSON
+            </button>
+          </div>
+
+          {debugSnapshot?.benchmark ? (
+            <p className="hint" style={{ marginTop: 10 }}>
+              狀態：{debugSnapshot.benchmark.active ? '進行中' : debugSnapshot.benchmark.done ? '已完成' : '未啟動'}
+              {'  '}| 進度 {debugSnapshot.benchmark.completedRounds}/{debugSnapshot.benchmark.targetRounds}
+            </p>
+          ) : null}
+
+          {debugSnapshot?.benchmark?.report ? (
+            <details style={{ marginTop: 10 }}>
+              <summary className="hint">顯示彙總報表（Report）</summary>
+              <pre className="codeBlock">
+                {JSON.stringify(debugSnapshot.benchmark.report, null, 2)}
+              </pre>
+            </details>
+          ) : null}
+
+          {benchmarkData ? (
+            <details style={{ marginTop: 10 }}>
+              <summary className="hint">顯示已匯出的 Benchmark JSON（可手動複製）</summary>
+              <pre className="codeBlock">{JSON.stringify(benchmarkData, null, 2)}</pre>
+            </details>
+          ) : (
+            <p className="hint" style={{ marginTop: 10 }}>
+              尚未匯出 JSON（按「匯出 Benchmark JSON」取得完整 rounds + report）。
+            </p>
+          )}
+        </div>
+
         <div className="gameLayout">
           <div>
             <GameHost
@@ -520,7 +655,9 @@ export default function BattlePage() {
               restartToken={restartToken}
               replayCommand={replayCommand}
               stageCommand={stageCommand}
+              benchmarkCommand={benchmarkCommand}
               onReplayData={handleReplayData}
+              onBenchmarkData={handleBenchmarkData}
               onDebugSnapshot={handleDebugSnapshot}
             />
             <p className="hint">
