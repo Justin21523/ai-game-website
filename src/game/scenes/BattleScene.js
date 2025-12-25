@@ -113,6 +113,13 @@ export class BattleScene extends Phaser.Scene {
       seed: null,
     }
 
+    // Guardrails:
+    // React->Phaser command bridges are easy to accidentally spam (e.g., dispatching a command
+    // on every React render). Rebuilding tilemaps repeatedly looks like "canvas flicker".
+    // We store a small key+timestamp so identical commands can be ignored briefly.
+    this._lastStageConfigApplyKey = null
+    this._lastStageConfigApplyAtMs = 0
+
     // Stage rotation settings (used for "watch AI tournament" mode).
     // When enabled, we generate a new stage after KO based on a deterministic seed sequence.
     this._stageRotation = {
@@ -505,9 +512,42 @@ export class BattleScene extends Phaser.Scene {
       delete normalizedConfig.heightTiles
     }
 
-    this._stageConfig = {
+    const prevKey = makeStageConfigKey(this._stageConfig)
+
+    const nextStageConfig = {
       ...this._stageConfig,
       ...normalizedConfig,
+    }
+
+    // ---- Idempotency / spam guard ----
+    //
+    // If the UI accidentally sends the same command repeatedly, rebuilding tilemaps each time
+    // causes visible flashing and can reset fighters mid-match.
+    const nextKey = makeStageConfigKey(nextStageConfig)
+    const cmdKey = `${nextKey}|reset:${resetMatch ? 1 : 0}`
+
+    const lastKey = this._lastStageConfigApplyKey
+    const lastAt = Number(this._lastStageConfigApplyAtMs ?? 0)
+    const tooSoonSameCommand = cmdKey === lastKey && nowMs - lastAt < 350
+
+    if (tooSoonSameCommand) {
+      if (this._log.enabled && this._log.verbose) {
+        this._log.warn('stage:ignored-duplicate-command', { cmdKey })
+      }
+      return
+    }
+
+    this._lastStageConfigApplyKey = cmdKey
+    this._lastStageConfigApplyAtMs = nowMs
+
+    // Persist the new config.
+    this._stageConfig = nextStageConfig
+
+    // If the stage config didn't actually change, avoid rebuilding the tilemap.
+    // `resetMatch` is still honored so the user can "restart" without changing the map.
+    if (nextKey === prevKey) {
+      if (resetMatch) this.resetMatch()
+      return
     }
 
     // Rebuild the stage and (optionally) restart the match so the result is immediately watchable.
@@ -3043,6 +3083,21 @@ function computeBtHashMeta(btJsonText) {
   } catch {
     return { hash: null, canonicalLength: 0 }
   }
+}
+
+function makeStageConfigKey(stageConfig) {
+  // Stable-ish key used for "did the stage generation inputs change" comparisons.
+  // We only include fields that affect stage generation to avoid false rebuilds.
+  const cfg = stageConfig ?? {}
+  return JSON.stringify({
+    style: cfg.style ?? null,
+    seed: cfg.seed ?? null,
+    widthTiles: cfg.widthTiles ?? null,
+    heightTiles: cfg.heightTiles ?? null,
+    offsetX: cfg.offsetX ?? null,
+    offsetY: cfg.offsetY ?? null,
+    tileSizePx: cfg.tileSizePx ?? null,
+  })
 }
 
 function normalizeControlMode(value) {
