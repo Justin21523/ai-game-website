@@ -162,6 +162,9 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
 
     // Hitstop: brief freeze to add impact feeling (we apply per-fighter for MVP).
     this._hitstopUntilMs = 0
+    // Store a velocity snapshot so hitstop can "pause" movement without deleting knockback.
+    // Without this, hits can look like a 1-frame teleport (velocity applied once, then zeroed).
+    this._hitstopStoredVelocity = null
 
     // Attack state (null means not attacking).
     this._attack = null
@@ -405,6 +408,7 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     this._hp = this._maxHp
     this._hitstunUntilMs = 0
     this._hitstopUntilMs = 0
+    this._hitstopStoredVelocity = null
     this._attack = null
     this._attackCooldownUntilMs = 0
     this._lastImpact = null
@@ -495,9 +499,26 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
   }
 
   updateFighter({ nowMs, opponent }) {
+    // If we *just* exited hitstop, restore the stored velocity once.
+    // This allows knockback to continue naturally after the brief freeze.
+    if (nowMs >= this._hitstopUntilMs && this._hitstopStoredVelocity) {
+      this.body.setVelocity(this._hitstopStoredVelocity.x, this._hitstopStoredVelocity.y)
+      this._hitstopStoredVelocity = null
+    }
+
     // If hitstop is active, we freeze control and dampen motion.
     // We still keep the visual sprite synced so it never drifts away from the physics body.
     if (nowMs < this._hitstopUntilMs) {
+      // Capture velocity only once at the start of hitstop.
+      // This preserves knockback velocity so it resumes after the freeze.
+      if (!this._hitstopStoredVelocity) {
+        this._hitstopStoredVelocity = {
+          x: Number(this.body.velocity.x ?? 0),
+          y: Number(this.body.velocity.y ?? 0),
+        }
+      }
+
+      // Freeze in place (no gravity/motion) during hitstop.
       this.body.setVelocity(0, 0)
       this._syncVisual()
       return
@@ -694,6 +715,18 @@ export class Fighter extends Phaser.Physics.Arcade.Sprite {
     const safeKnockbackX = Number.isFinite(knockbackX) ? knockbackX : 0
     const safeKnockbackY = Number.isFinite(knockbackY) ? knockbackY : 0
     this.body.setVelocity(direction * safeKnockbackX, -Math.abs(safeKnockbackY))
+
+    // IMPORTANT:
+    // Hitstop should not delete knockback.
+    // If we simply set velocity to 0 during hitstop without remembering it,
+    // the knockback would only apply for a single frame and look like a teleport.
+    if (safeHitstopMs > 0) {
+      this._hitstopStoredVelocity = {
+        x: Number(this.body.velocity.x ?? 0),
+        y: Number(this.body.velocity.y ?? 0),
+      }
+      this.body.setVelocity(0, 0)
+    }
 
     // Store the last impact so debug UI can show what happened recently.
     this._lastImpact = { kind: String(impactKind ?? 'hit'), atMs: nowMs ?? 0 }
