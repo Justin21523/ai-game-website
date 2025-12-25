@@ -215,6 +215,36 @@ export class BattleScene extends Phaser.Scene {
       report: null,
     }
 
+    // Batch benchmark:
+    // Run multiple benchmark sessions across multiple stage seeds automatically.
+    //
+    // Why:
+    // - One seed can bias results (a layout might be "good" or "bad" for a specific AI).
+    // - Batch runs make AI tuning more robust and reduce manual re-testing effort.
+    this._benchmarkBatch = {
+      enabled: false,
+      done: false,
+      // Seeds (integers) to run in order.
+      seeds: [],
+      // Index of the *current* seed run in `seeds`.
+      seedIndex: 0,
+      // Per-seed benchmark length.
+      roundsPerSeed: 0,
+      // Small pause between seeds (ms) so the watcher can see transitions.
+      pauseBetweenSeedsMs: 450,
+      // If true, we are between runs and will start the next seed after `_koResumeAtMs`.
+      waitingForNextSeed: false,
+      // Optional stage config template applied on every seed (style/size).
+      stageConfigTemplate: null,
+      // Collected benchmark exports (one per seed).
+      runs: [],
+      // Timing markers (Phaser clock ms).
+      startedAtMs: 0,
+      finishedAtMs: 0,
+      // When batch overrides stage-rotation, we restore it at the end.
+      restoreStageRotation: null,
+    }
+
     // Time accumulator for throttled debug updates.
     this._debugAccumulatorMs = 0
 
@@ -573,24 +603,8 @@ export class BattleScene extends Phaser.Scene {
     const b = this._benchmark
     if (!b) return null
 
-    // Include a stable BT hash so benchmark runs can be compared across:
-    // - different BT JSON versions
-    // - different profile weights
-    // - different stage seeds
-    //
-    // We hash the *canonicalized* JSON (stringified object) so whitespace differences
-    // in the source text do not create different hashes.
-    let btHash = null
-    let btCanonicalLength = 0
-    try {
-      const btObject = parseBtJsonText(this._initialBtJsonText)
-      const canonicalText = JSON.stringify(btObject)
-      btCanonicalLength = canonicalText ? canonicalText.length : 0
-      btHash = canonicalText ? hashStringFNV1a32(canonicalText) : null
-    } catch {
-      btHash = null
-      btCanonicalLength = 0
-    }
+    // Include a stable BT hash so benchmark runs can be compared across versions.
+    const btMeta = computeBtHashMeta(this._initialBtJsonText)
 
     return {
       exportedAtMs: nowMs,
@@ -600,10 +614,7 @@ export class BattleScene extends Phaser.Scene {
         startedAtRound: Number(b.startedAtRound ?? 0),
         startedAtMs: Number(b.startedAtMs ?? 0),
       },
-      bt: {
-        hash: btHash,
-        canonicalLength: btCanonicalLength,
-      },
+      bt: btMeta,
       aiProfiles: { ...this._aiProfiles },
       stage: this._stageMeta ? { ...this._stageMeta } : null,
       stageConfig: this._stageConfig ? { ...this._stageConfig } : null,
@@ -611,6 +622,170 @@ export class BattleScene extends Phaser.Scene {
       rounds: Array.isArray(b.rounds) ? b.rounds.slice() : [],
       report: b.report ?? null,
     }
+  }
+
+  startBenchmarkBatch({
+    // Either provide explicit seeds (array) OR use seedStart + seedCount.
+    seeds,
+    seedStart,
+    seedCount = 10,
+    roundsPerSeed = 20,
+    pauseBetweenSeedsMs = 450,
+    // Optional stage template applied to every seed run.
+    // Example: { style, widthTiles, heightTiles }
+    stageConfigTemplate,
+  } = {}) {
+    // Public API used by React UI:
+    // Run multiple seeds back-to-back and collect a benchmark export per seed.
+    const nowMs = this.time?.now ?? 0
+
+    // Stop any in-progress batch (idempotent) and stop single benchmark collection.
+    this.stopBenchmarkBatch()
+    this.stopBenchmark()
+
+    const desiredSeedCount = Number(seedCount ?? 0)
+    const clampedSeedCount = Number.isFinite(desiredSeedCount)
+      ? Math.max(1, Math.min(200, Math.round(desiredSeedCount)))
+      : 10
+
+    const desiredRounds = Number(roundsPerSeed ?? 0)
+    const clampedRounds = Number.isFinite(desiredRounds) ? Math.max(1, Math.min(500, Math.round(desiredRounds))) : 20
+
+    const desiredPause = Number(pauseBetweenSeedsMs ?? 0)
+    const clampedPauseMs = Number.isFinite(desiredPause) ? Math.max(0, Math.min(5000, Math.round(desiredPause))) : 450
+
+    // Build seed list.
+    let seedList = []
+    if (Array.isArray(seeds) && seeds.length) {
+      // Accept mixed types but normalize to unsigned 32-bit integers for reproducibility.
+      seedList = seeds
+        .map((value) => {
+          const n = Number(value)
+          if (Number.isFinite(n)) return n >>> 0
+          return null
+        })
+        .filter((n) => n != null)
+        .slice(0, 200)
+    }
+
+    if (!seedList.length) {
+      // If no explicit list, generate sequential seeds starting from:
+      // - provided seedStart
+      // - or current stage seed
+      // - or Date.now (fallback)
+      const baseSeedCandidate =
+        seedStart != null && seedStart !== '' ? seedStart : this._stageMeta?.seed ?? (Date.now() >>> 0)
+      const baseSeedNumber = Number(baseSeedCandidate)
+      const baseSeed = Number.isFinite(baseSeedNumber) ? (baseSeedNumber >>> 0) : (Date.now() >>> 0)
+
+      seedList = []
+      for (let i = 0; i < clampedSeedCount; i += 1) seedList.push((baseSeed + i) >>> 0)
+    }
+
+    // Temporarily disable auto stage rotation during batch.
+    // Reason: batch already provides variety via seed changes, and rotation adds noise to comparisons.
+    const restoreStageRotation = this._stageRotation ? { ...this._stageRotation } : null
+    this._stageRotation = { enabled: false, everyNRounds: 1 }
+
+    this._benchmarkBatch = {
+      enabled: true,
+      done: false,
+      seeds: seedList,
+      seedIndex: 0,
+      roundsPerSeed: clampedRounds,
+      pauseBetweenSeedsMs: clampedPauseMs,
+      waitingForNextSeed: false,
+      stageConfigTemplate: stageConfigTemplate ? { ...stageConfigTemplate } : null,
+      runs: [],
+      startedAtMs: nowMs,
+      finishedAtMs: 0,
+      restoreStageRotation,
+    }
+
+    // Kick off the first seed immediately.
+    this._startBenchmarkBatchSeed({ seedIndex: 0 })
+
+    if (this._log.enabled) {
+      this._log.info('benchmark:batch:start', {
+        seedCount: seedList.length,
+        roundsPerSeed: clampedRounds,
+        pauseBetweenSeedsMs: clampedPauseMs,
+        stageConfigTemplate: this._benchmarkBatch.stageConfigTemplate,
+      })
+    }
+  }
+
+  stopBenchmarkBatch() {
+    // Public API used by React UI:
+    // Stop batch mode but keep any collected runs for export.
+    const batch = this._benchmarkBatch
+    if (!batch) return
+
+    // Restore stage rotation if batch had overridden it.
+    if (batch.restoreStageRotation) this._stageRotation = { ...batch.restoreStageRotation }
+
+    batch.enabled = false
+    batch.waitingForNextSeed = false
+
+    if (this._log.enabled) this._log.info('benchmark:batch:stop', { runs: batch.runs?.length ?? 0 })
+  }
+
+  exportBenchmarkBatch() {
+    // Public API used by React UI:
+    // Export batch benchmark results (multiple seed runs).
+    const nowMs = this.time?.now ?? 0
+    const batch = this._benchmarkBatch
+    if (!batch) return null
+
+    const runs = Array.isArray(batch.runs) ? batch.runs.slice() : []
+
+    // Aggregate report across all rounds in all runs.
+    const allRounds = []
+    for (const run of runs) {
+      if (Array.isArray(run?.rounds)) allRounds.push(...run.rounds)
+    }
+
+    return {
+      kind: 'benchmarkBatch',
+      exportedAtMs: nowMs,
+      bt: computeBtHashMeta(this._initialBtJsonText),
+      aiProfiles: { ...this._aiProfiles },
+      stageConfigTemplate: batch.stageConfigTemplate ? { ...batch.stageConfigTemplate } : null,
+      batch: {
+        seeds: Array.isArray(batch.seeds) ? batch.seeds.slice() : [],
+        roundsPerSeed: Number(batch.roundsPerSeed ?? 0),
+        pauseBetweenSeedsMs: Number(batch.pauseBetweenSeedsMs ?? 0),
+        startedAtMs: Number(batch.startedAtMs ?? 0),
+        finishedAtMs: Number(batch.finishedAtMs ?? 0) || null,
+        seedIndex: Number(batch.seedIndex ?? 0),
+        totalSeeds: Array.isArray(batch.seeds) ? batch.seeds.length : 0,
+        completedSeeds: runs.length,
+        done: Boolean(batch.done),
+        active: Boolean(batch.enabled),
+      },
+      runs,
+      report: computeBenchmarkReport(allRounds),
+    }
+  }
+
+  _startBenchmarkBatchSeed({ seedIndex }) {
+    // Internal helper:
+    // Apply stage seed/template and start a fresh benchmark run.
+    const batch = this._benchmarkBatch
+    if (!batch?.enabled) return
+
+    const seed = Array.isArray(batch.seeds) ? batch.seeds[seedIndex] : null
+    if (seed == null) return
+
+    // Apply stage config template (style/size) while overriding the seed.
+    const template = batch.stageConfigTemplate ? { ...batch.stageConfigTemplate } : {}
+    this.setStageConfig({ ...template, seed, resetMatch: false })
+
+    // Start a new benchmark run for this seed.
+    // We force resetMatch so each seed is independent and round numbers start from 1.
+    this.startBenchmark({ rounds: batch.roundsPerSeed, stopOnComplete: true, resetMatch: true })
+
+    if (this._log.enabled) this._log.info('benchmark:batch:seed', { seedIndex, seed })
   }
 
   create() {
@@ -1489,6 +1664,14 @@ export class BattleScene extends Phaser.Scene {
     // When the pause ends, start the next round immediately.
     if (nowMs < this._koResumeAtMs) return
 
+    // Batch benchmark flow:
+    // If we are between seed runs, start the next seed instead of resuming the round.
+    if (this._benchmarkBatch?.enabled && this._benchmarkBatch.waitingForNextSeed) {
+      this._benchmarkBatch.waitingForNextSeed = false
+      this._startBenchmarkBatchSeed({ seedIndex: this._benchmarkBatch.seedIndex })
+      return
+    }
+
     // If benchmark mode is running and we reached the target, freeze on the KO screen.
     // This is the "evaluation loop" end condition.
     const benchmarkDone =
@@ -1496,6 +1679,88 @@ export class BattleScene extends Phaser.Scene {
       Boolean(this._benchmark?.stopOnComplete) &&
       Number(this._benchmark?.targetRounds ?? 0) > 0 &&
       Number(this._benchmark?.completedRounds ?? 0) >= Number(this._benchmark?.targetRounds ?? 0)
+
+    // If we are in batch mode, "benchmark done" means:
+    // - export the current run
+    // - move to the next seed (or finish the batch)
+    if (benchmarkDone && this._benchmarkBatch?.enabled) {
+      const batch = this._benchmarkBatch
+
+      // Stop collecting for the current run.
+      this._benchmark.enabled = false
+
+      // Store a copy of the run export for this seed.
+      const runPayload = this.exportBenchmark()
+      if (runPayload) {
+        batch.runs.push({
+          ...runPayload,
+          batch: {
+            seedIndex: Number(batch.seedIndex ?? 0),
+            seed: Array.isArray(batch.seeds) ? batch.seeds[Number(batch.seedIndex ?? 0)] ?? null : null,
+          },
+        })
+      }
+
+      const isLastSeed =
+        Array.isArray(batch.seeds) && Number(batch.seedIndex ?? 0) >= Math.max(0, batch.seeds.length - 1)
+
+      if (isLastSeed) {
+        // Finish the batch and freeze the scene on a FINISH banner.
+        batch.enabled = false
+        batch.done = true
+        batch.finishedAtMs = nowMs
+        batch.waitingForNextSeed = false
+
+        // Restore stage rotation if we temporarily disabled it.
+        if (batch.restoreStageRotation) this._stageRotation = { ...batch.restoreStageRotation }
+
+        // Switch to DONE phase to freeze update() loop.
+        this._roundPhase = ROUND_PHASE.DONE
+
+        // Show a compact summary.
+        if (this._koText) this._koText.setText('FINISH')
+        if (this._koSubText) {
+          const totalSeeds = Array.isArray(batch.seeds) ? batch.seeds.length : 0
+          const totalRounds = batch.runs.reduce((sum, r) => sum + (Array.isArray(r?.rounds) ? r.rounds.length : 0), 0)
+          const report = computeBenchmarkReport(
+            batch.runs.flatMap((r) => (Array.isArray(r?.rounds) ? r.rounds : [])),
+          )
+          const avgKoSec = report?.avgKoTimeMs ? Math.round(report.avgKoTimeMs / 100) / 10 : null
+          const leftWins = report?.wins?.left ?? 0
+          const rightWins = report?.wins?.right ?? 0
+          const draws = report?.wins?.draw ?? 0
+
+          this._koSubText.setText(
+            `Batch 完成：${batch.runs.length}/${totalSeeds} seeds，${totalRounds} rounds  ` +
+              `|  勝率 L:${leftWins} R:${rightWins} D:${draws}` +
+              (avgKoSec != null ? `  |  平均 KO ${avgKoSec}s` : ''),
+          )
+        }
+
+        this._setKoOverlayVisible(true)
+        this._koResumeAtMs = 0
+        return
+      }
+
+      // Not the last seed: schedule the next seed start.
+      batch.seedIndex = Number(batch.seedIndex ?? 0) + 1
+      batch.waitingForNextSeed = true
+
+      // Keep overlay visible during the transition so the watcher sees it.
+      if (this._koText) this._koText.setText('NEXT')
+      if (this._koSubText) {
+        const nextSeed = Array.isArray(batch.seeds) ? batch.seeds[Number(batch.seedIndex ?? 0)] ?? null : null
+        const totalSeeds = Array.isArray(batch.seeds) ? batch.seeds.length : 0
+        this._koSubText.setText(
+          `下一張地圖：seed ${nextSeed ?? '—'}（${Number(batch.seedIndex ?? 0) + 1}/${totalSeeds}）`,
+        )
+      }
+      this._setKoOverlayVisible(true)
+
+      // Reuse KO timer as a generic "transition delay" timer.
+      this._koResumeAtMs = nowMs + Number(batch.pauseBetweenSeedsMs ?? 0)
+      return
+    }
 
     if (benchmarkDone) {
       // Stop collecting so the UI can treat the run as complete.
@@ -1771,6 +2036,17 @@ export class BattleScene extends Phaser.Scene {
               Number(this._benchmark.targetRounds ?? 0) > 0 &&
               Number(this._benchmark.completedRounds ?? 0) >= Number(this._benchmark.targetRounds ?? 0),
             report: this._benchmark.report,
+          }
+        : null,
+      benchmarkBatch: this._benchmarkBatch
+        ? {
+            active: Boolean(this._benchmarkBatch.enabled),
+            done: Boolean(this._benchmarkBatch.done),
+            totalSeeds: Array.isArray(this._benchmarkBatch.seeds) ? this._benchmarkBatch.seeds.length : 0,
+            seedIndex: Number(this._benchmarkBatch.seedIndex ?? 0),
+            completedSeeds: Array.isArray(this._benchmarkBatch.runs) ? this._benchmarkBatch.runs.length : 0,
+            roundsPerSeed: Number(this._benchmarkBatch.roundsPerSeed ?? 0),
+            waitingForNextSeed: Boolean(this._benchmarkBatch.waitingForNextSeed),
           }
         : null,
       btLoaded: Boolean(this._initialBtJsonText),
@@ -2616,6 +2892,23 @@ function hashStringFNV1a32(text) {
 
   // Convert to unsigned and format as fixed 8-char hex.
   return (hash >>> 0).toString(16).padStart(8, '0')
+}
+
+function computeBtHashMeta(btJsonText) {
+  // Compute a stable BT identifier for regression testing.
+  //
+  // We parse JSON and stringify it back to remove whitespace differences.
+  // (Key order differences can still affect the output; that's acceptable for MVP.)
+  try {
+    const btObject = parseBtJsonText(btJsonText)
+    const canonicalText = JSON.stringify(btObject)
+    return {
+      hash: canonicalText ? hashStringFNV1a32(canonicalText) : null,
+      canonicalLength: canonicalText ? canonicalText.length : 0,
+    }
+  } catch {
+    return { hash: null, canonicalLength: 0 }
+  }
 }
 
 function normalizeControlMode(value) {

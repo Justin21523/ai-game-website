@@ -388,15 +388,34 @@ export default function GameHost({
           }
           break
         }
+        case 'startBenchmarkBatch': {
+          if (typeof scene.startBenchmarkBatch === 'function') {
+            scene.startBenchmarkBatch(benchmarkCommand.payload)
+          }
+          break
+        }
         case 'stopBenchmark': {
           if (typeof scene.stopBenchmark === 'function') {
             scene.stopBenchmark()
           }
           break
         }
+        case 'stopBenchmarkBatch': {
+          if (typeof scene.stopBenchmarkBatch === 'function') {
+            scene.stopBenchmarkBatch()
+          }
+          break
+        }
         case 'exportBenchmark': {
           if (typeof scene.exportBenchmark === 'function') {
             const data = scene.exportBenchmark()
+            if (data && typeof onBenchmarkData === 'function') onBenchmarkData(data)
+          }
+          break
+        }
+        case 'exportBenchmarkBatch': {
+          if (typeof scene.exportBenchmarkBatch === 'function') {
+            const data = scene.exportBenchmarkBatch()
             if (data && typeof onBenchmarkData === 'function') onBenchmarkData(data)
           }
           break

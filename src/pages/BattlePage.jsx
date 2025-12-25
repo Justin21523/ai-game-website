@@ -61,20 +61,23 @@ function escapeCsvCell(value) {
 }
 
 function buildBenchmarkCsv(benchmarkData) {
-  // Convert the exported benchmark JSON payload into a flat CSV table.
+  // Convert exported benchmark JSON into a flat CSV table.
+  //
+  // Supported payload shapes:
+  // - Single run: `{ rounds: [...] }`
+  // - Batch run:  `{ kind: 'benchmarkBatch', runs: [ { rounds: [...] }, ... ] }`
   //
   // Design:
   // - 1 row per round (easiest to analyze in spreadsheets)
   // - Repeat run-level metadata on every row for easy pivot tables
-  const rounds = Array.isArray(benchmarkData?.rounds) ? benchmarkData.rounds : []
-  const btHash = benchmarkData?.bt?.hash ?? ''
-  const leftProfile = benchmarkData?.aiProfiles?.left ?? ''
-  const rightProfile = benchmarkData?.aiProfiles?.right ?? ''
+  const isBatch = Array.isArray(benchmarkData?.runs)
 
   const header = [
     'btHash',
     'leftProfile',
     'rightProfile',
+    'runIndex',
+    'runSeed',
     'roundNumber',
     'winner',
     'durationMs',
@@ -106,11 +109,27 @@ function buildBenchmarkCsv(benchmarkData) {
 
   const lines = [header.map(escapeCsvCell).join(',')]
 
-  for (const r of rounds) {
+  const runs = isBatch ? benchmarkData.runs : [benchmarkData]
+
+  for (let runIndex = 0; runIndex < runs.length; runIndex += 1) {
+    const run = runs[runIndex]
+    if (!run) continue
+
+    const rounds = Array.isArray(run?.rounds) ? run.rounds : []
+    const btHash = run?.bt?.hash ?? benchmarkData?.bt?.hash ?? ''
+    const leftProfile = run?.aiProfiles?.left ?? benchmarkData?.aiProfiles?.left ?? ''
+    const rightProfile = run?.aiProfiles?.right ?? benchmarkData?.aiProfiles?.right ?? ''
+
+    // Prefer the explicit batch seed, otherwise fall back to stage seed.
+    const runSeed = run?.batch?.seed ?? run?.stage?.seed ?? benchmarkData?.stage?.seed ?? ''
+
+    for (const r of rounds) {
     const row = [
       btHash,
       leftProfile,
       rightProfile,
+      run?.batch?.seedIndex ?? runIndex,
+      runSeed,
       r?.roundNumber ?? '',
       r?.winner ?? '',
       r?.durationMs ?? '',
@@ -141,6 +160,7 @@ function buildBenchmarkCsv(benchmarkData) {
     ]
 
     lines.push(row.map(escapeCsvCell).join(','))
+  }
   }
 
   return lines.join('\n')
@@ -209,6 +229,12 @@ export default function BattlePage() {
   const [benchmarkResetMatch, setBenchmarkResetMatch] = useState(true)
   const [benchmarkCommand, setBenchmarkCommand] = useState(null)
   const [benchmarkData, setBenchmarkData] = useState(null)
+
+  // Batch benchmark controls.
+  const [batchSeedStart, setBatchSeedStart] = useState('')
+  const [batchSeedCount, setBatchSeedCount] = useState(10)
+  const [batchRoundsPerSeed, setBatchRoundsPerSeed] = useState(20)
+  const [batchPauseBetweenSeedsMs, setBatchPauseBetweenSeedsMs] = useState(450)
 
   // Increment this number to request a "reset match" from the running Phaser scene.
   // Using a monotonically increasing token is a simple way to trigger an effect.
@@ -340,6 +366,7 @@ export default function BattlePage() {
 
   // Benchmark helpers: start/stop/export.
   function startBenchmark() {
+    setBenchmarkData(null)
     setBenchmarkCommand({
       type: 'startBenchmark',
       payload: {
@@ -356,6 +383,33 @@ export default function BattlePage() {
 
   function exportBenchmark() {
     setBenchmarkCommand({ type: 'exportBenchmark', payload: {} })
+  }
+
+  function startBenchmarkBatch() {
+    // Batch uses current stage style/size as a template and iterates over multiple seeds.
+    setBenchmarkData(null)
+    setBenchmarkCommand({
+      type: 'startBenchmarkBatch',
+      payload: {
+        seedStart: batchSeedStart || stageSeed || null,
+        seedCount: batchSeedCount,
+        roundsPerSeed: batchRoundsPerSeed,
+        pauseBetweenSeedsMs: batchPauseBetweenSeedsMs,
+        stageConfigTemplate: {
+          style: stageStyle,
+          widthTiles: stageWidthTiles,
+          heightTiles: stageHeightTiles,
+        },
+      },
+    })
+  }
+
+  function stopBenchmarkBatch() {
+    setBenchmarkCommand({ type: 'stopBenchmarkBatch', payload: {} })
+  }
+
+  function exportBenchmarkBatch() {
+    setBenchmarkCommand({ type: 'exportBenchmarkBatch', payload: {} })
   }
 
   async function copyBenchmarkJson() {
@@ -396,7 +450,9 @@ export default function BattlePage() {
     const rightProfile = benchmarkData?.aiProfiles?.right ?? 'right'
     const btHash = benchmarkData?.bt?.hash ?? 'bt'
 
-    const filename = `benchmark_${leftProfile}_vs_${rightProfile}_${btHash}_${Date.now()}.csv`
+    const seedCount = Array.isArray(benchmarkData?.runs) ? benchmarkData.runs.length : null
+    const batchTag = seedCount != null ? `_batch_${seedCount}seeds` : ''
+    const filename = `benchmark${batchTag}_${leftProfile}_vs_${rightProfile}_${btHash}_${Date.now()}.csv`
     downloadTextFile({ filename, text: benchmarkCsv, mimeType: 'text/csv;charset=utf-8' })
   }
 
@@ -773,6 +829,94 @@ export default function BattlePage() {
             >
               複製 CSV
             </button>
+          </div>
+
+          <div className="controlPanel" style={{ marginTop: 14 }}>
+            <h4 className="cardTitle" style={{ margin: 0 }}>
+              批次（Batch / 多 seed）
+            </h4>
+            <p className="hint" style={{ marginTop: 8 }}>
+              一次跑多個 seed（每個 seed 跑固定回合數），可降低「單一地圖偏差」並方便做 AI 回歸測試。
+            </p>
+
+            <div className="buttonRow" style={{ marginTop: 10 }}>
+              <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                seed 起點（可留空＝沿用目前 seed）
+                <input
+                  className="input"
+                  style={{ width: 160 }}
+                  value={batchSeedStart}
+                  onChange={(event) => setBatchSeedStart(event.target.value)}
+                  placeholder={stageInfo?.seedLabel ?? String(stageInfo?.seed ?? '')}
+                />
+              </label>
+
+              <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                seed 數量
+                <input
+                  className="input"
+                  style={{ width: 110 }}
+                  type="number"
+                  min="1"
+                  max="200"
+                  value={batchSeedCount}
+                  onChange={(event) => setBatchSeedCount(Number(event.target.value))}
+                />
+              </label>
+
+              <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                每 seed 回合數
+                <input
+                  className="input"
+                  style={{ width: 120 }}
+                  type="number"
+                  min="1"
+                  max="500"
+                  value={batchRoundsPerSeed}
+                  onChange={(event) => setBatchRoundsPerSeed(Number(event.target.value))}
+                />
+              </label>
+
+              <label className="hint" style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                seed 間隔（ms）
+                <input
+                  className="input"
+                  style={{ width: 120 }}
+                  type="number"
+                  min="0"
+                  max="5000"
+                  value={batchPauseBetweenSeedsMs}
+                  onChange={(event) => setBatchPauseBetweenSeedsMs(Number(event.target.value))}
+                />
+              </label>
+            </div>
+
+            <div className="buttonRow" style={{ marginTop: 10 }}>
+              <button className="button" type="button" onClick={startBenchmarkBatch}>
+                開始 Batch
+              </button>
+              <button className="button buttonSecondary" type="button" onClick={stopBenchmarkBatch}>
+                停止 Batch
+              </button>
+              <button className="button buttonSecondary" type="button" onClick={exportBenchmarkBatch}>
+                匯出 Batch JSON
+              </button>
+            </div>
+
+            {debugSnapshot?.benchmarkBatch ? (
+              <p className="hint" style={{ marginTop: 10 }}>
+                Batch 狀態：
+                {debugSnapshot.benchmarkBatch.active
+                  ? debugSnapshot.benchmarkBatch.waitingForNextSeed
+                    ? '切換地圖中'
+                    : '進行中'
+                  : debugSnapshot.benchmarkBatch.done
+                    ? '已完成'
+                    : '未啟動'}
+                {'  '}| 進度 {debugSnapshot.benchmarkBatch.completedSeeds}/{debugSnapshot.benchmarkBatch.totalSeeds}
+                {'  '}| 目前 seed index {debugSnapshot.benchmarkBatch.seedIndex}
+              </p>
+            ) : null}
           </div>
 
           {debugSnapshot?.benchmark ? (
