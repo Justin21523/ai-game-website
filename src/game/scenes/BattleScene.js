@@ -552,6 +552,11 @@ export class BattleScene extends Phaser.Scene {
       this._roundPhase = ROUND_PHASE.FIGHT
       this._setKoOverlayVisible(false)
       this._koResumeAtMs = 0
+
+      // If we leave DONE without resetting fighters, one side may still be at 0 HP,
+      // which would instantly re-trigger KO on the next update frame.
+      const nowMs = this.time?.now ?? 0
+      if (this._leftFighter && this._rightFighter) this._resetFighters({ nowMs })
     }
 
     if (this._log.enabled) this._log.info('benchmark:stop')
