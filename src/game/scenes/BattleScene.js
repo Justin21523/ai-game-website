@@ -573,6 +573,25 @@ export class BattleScene extends Phaser.Scene {
     const b = this._benchmark
     if (!b) return null
 
+    // Include a stable BT hash so benchmark runs can be compared across:
+    // - different BT JSON versions
+    // - different profile weights
+    // - different stage seeds
+    //
+    // We hash the *canonicalized* JSON (stringified object) so whitespace differences
+    // in the source text do not create different hashes.
+    let btHash = null
+    let btCanonicalLength = 0
+    try {
+      const btObject = parseBtJsonText(this._initialBtJsonText)
+      const canonicalText = JSON.stringify(btObject)
+      btCanonicalLength = canonicalText ? canonicalText.length : 0
+      btHash = canonicalText ? hashStringFNV1a32(canonicalText) : null
+    } catch {
+      btHash = null
+      btCanonicalLength = 0
+    }
+
     return {
       exportedAtMs: nowMs,
       config: {
@@ -581,8 +600,14 @@ export class BattleScene extends Phaser.Scene {
         startedAtRound: Number(b.startedAtRound ?? 0),
         startedAtMs: Number(b.startedAtMs ?? 0),
       },
+      bt: {
+        hash: btHash,
+        canonicalLength: btCanonicalLength,
+      },
       aiProfiles: { ...this._aiProfiles },
       stage: this._stageMeta ? { ...this._stageMeta } : null,
+      stageConfig: this._stageConfig ? { ...this._stageConfig } : null,
+      stageRotation: this._stageRotation ? { ...this._stageRotation } : null,
       rounds: Array.isArray(b.rounds) ? b.rounds.slice() : [],
       report: b.report ?? null,
     }
@@ -2572,6 +2597,25 @@ function computeBenchmarkReport(rounds) {
     avgBlocks: { left: sumLeftBlocks / total, right: sumRightBlocks / total },
     avgDodges: { left: sumLeftDodges / total, right: sumRightDodges / total },
   }
+}
+
+function hashStringFNV1a32(text) {
+  // Tiny deterministic hash for debugging/regression testing.
+  //
+  // Why not crypto?
+  // - We want a zero-dependency helper that works in the browser sandbox.
+  // - 32-bit FNV-1a is good enough to "fingerprint" a BT JSON blob for comparisons.
+  const str = String(text ?? '')
+  let hash = 2166136261
+
+  for (let i = 0; i < str.length; i += 1) {
+    hash ^= str.charCodeAt(i)
+    // `Math.imul` keeps multiplication in 32-bit integer space.
+    hash = Math.imul(hash, 16777619)
+  }
+
+  // Convert to unsigned and format as fixed 8-char hex.
+  return (hash >>> 0).toString(16).padStart(8, '0')
 }
 
 function normalizeControlMode(value) {

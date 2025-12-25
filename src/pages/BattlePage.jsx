@@ -51,6 +51,119 @@ function clearStoredReplay() {
   }
 }
 
+function escapeCsvCell(value) {
+  // Minimal CSV escaping:
+  // - Wrap in quotes if the cell contains commas/newlines/quotes.
+  // - Escape quotes by doubling them.
+  const text = value == null ? '' : String(value)
+  if (!/[,"\n\r]/.test(text)) return text
+  return `"${text.replace(/"/g, '""')}"`
+}
+
+function buildBenchmarkCsv(benchmarkData) {
+  // Convert the exported benchmark JSON payload into a flat CSV table.
+  //
+  // Design:
+  // - 1 row per round (easiest to analyze in spreadsheets)
+  // - Repeat run-level metadata on every row for easy pivot tables
+  const rounds = Array.isArray(benchmarkData?.rounds) ? benchmarkData.rounds : []
+  const btHash = benchmarkData?.bt?.hash ?? ''
+  const leftProfile = benchmarkData?.aiProfiles?.left ?? ''
+  const rightProfile = benchmarkData?.aiProfiles?.right ?? ''
+
+  const header = [
+    'btHash',
+    'leftProfile',
+    'rightProfile',
+    'roundNumber',
+    'winner',
+    'durationMs',
+    'stageStyle',
+    'stageSeed',
+    'leftHpEnd',
+    'rightHpEnd',
+    'leftAttacksStarted',
+    'leftHitsLanded',
+    'leftHitsBlocked',
+    'leftHitsDodged',
+    'leftDamageDealt',
+    'leftChipDamageDealt',
+    'leftBlocks',
+    'leftDodges',
+    'leftDashes',
+    'leftDodgesStarted',
+    'rightAttacksStarted',
+    'rightHitsLanded',
+    'rightHitsBlocked',
+    'rightHitsDodged',
+    'rightDamageDealt',
+    'rightChipDamageDealt',
+    'rightBlocks',
+    'rightDodges',
+    'rightDashes',
+    'rightDodgesStarted',
+  ]
+
+  const lines = [header.map(escapeCsvCell).join(',')]
+
+  for (const r of rounds) {
+    const row = [
+      btHash,
+      leftProfile,
+      rightProfile,
+      r?.roundNumber ?? '',
+      r?.winner ?? '',
+      r?.durationMs ?? '',
+      r?.stage?.style ?? '',
+      r?.stage?.seed ?? '',
+      r?.leftHpEnd ?? '',
+      r?.rightHpEnd ?? '',
+      r?.left?.attacksStarted ?? 0,
+      r?.left?.hitsLanded ?? 0,
+      r?.left?.hitsBlocked ?? 0,
+      r?.left?.hitsDodged ?? 0,
+      r?.left?.damageDealt ?? 0,
+      r?.left?.chipDamageDealt ?? 0,
+      r?.left?.blocks ?? 0,
+      r?.left?.dodges ?? 0,
+      r?.left?.dashes ?? 0,
+      r?.left?.dodgesStarted ?? 0,
+      r?.right?.attacksStarted ?? 0,
+      r?.right?.hitsLanded ?? 0,
+      r?.right?.hitsBlocked ?? 0,
+      r?.right?.hitsDodged ?? 0,
+      r?.right?.damageDealt ?? 0,
+      r?.right?.chipDamageDealt ?? 0,
+      r?.right?.blocks ?? 0,
+      r?.right?.dodges ?? 0,
+      r?.right?.dashes ?? 0,
+      r?.right?.dodgesStarted ?? 0,
+    ]
+
+    lines.push(row.map(escapeCsvCell).join(','))
+  }
+
+  return lines.join('\n')
+}
+
+function downloadTextFile({ filename, text, mimeType } = {}) {
+  // Small helper for downloading a string as a file.
+  // Used for exporting CSV without adding dependencies.
+  const safeName = filename ? String(filename) : `export_${Date.now()}.txt`
+  const blob = new Blob([String(text ?? '')], { type: mimeType ?? 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+
+  const a = document.createElement('a')
+  a.href = url
+  a.download = safeName
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+
+  // Revoke after the click so the browser can read it.
+  setTimeout(() => URL.revokeObjectURL(url), 0)
+}
+
 export default function BattlePage() {
   // Read the saved BT JSON once when the page renders.
   // If none exists, GameHost will pass null and the scene can fall back to defaults.
@@ -257,6 +370,34 @@ export default function BattlePage() {
     } catch {
       alert('複製失敗：瀏覽器不允許 clipboard 存取。請改用「顯示 JSON」手動複製。')
     }
+  }
+
+  const benchmarkCsv = useMemo(
+    () => (benchmarkData ? buildBenchmarkCsv(benchmarkData) : ''),
+    [benchmarkData],
+  )
+
+  async function copyBenchmarkCsv() {
+    // Copy CSV to clipboard so you can paste into Google Sheets / Excel quickly.
+    if (!benchmarkCsv) return
+
+    try {
+      await navigator.clipboard.writeText(benchmarkCsv)
+      alert('已複製 Benchmark CSV 到剪貼簿。')
+    } catch {
+      alert('複製失敗：瀏覽器不允許 clipboard 存取。請改用「下載 CSV」。')
+    }
+  }
+
+  function downloadBenchmarkCsv() {
+    if (!benchmarkCsv) return
+
+    const leftProfile = benchmarkData?.aiProfiles?.left ?? 'left'
+    const rightProfile = benchmarkData?.aiProfiles?.right ?? 'right'
+    const btHash = benchmarkData?.bt?.hash ?? 'bt'
+
+    const filename = `benchmark_${leftProfile}_vs_${rightProfile}_${btHash}_${Date.now()}.csv`
+    downloadTextFile({ filename, text: benchmarkCsv, mimeType: 'text/csv;charset=utf-8' })
   }
 
   return (
@@ -616,6 +757,22 @@ export default function BattlePage() {
             >
               複製 JSON
             </button>
+            <button
+              className="button buttonSecondary"
+              type="button"
+              onClick={downloadBenchmarkCsv}
+              disabled={!benchmarkCsv}
+            >
+              下載 CSV
+            </button>
+            <button
+              className="button buttonSecondary"
+              type="button"
+              onClick={copyBenchmarkCsv}
+              disabled={!benchmarkCsv}
+            >
+              複製 CSV
+            </button>
           </div>
 
           {debugSnapshot?.benchmark ? (
@@ -644,6 +801,13 @@ export default function BattlePage() {
               尚未匯出 JSON（按「匯出 Benchmark JSON」取得完整 rounds + report）。
             </p>
           )}
+
+          {benchmarkCsv ? (
+            <details style={{ marginTop: 10 }}>
+              <summary className="hint">顯示已匯出的 Benchmark CSV（可手動複製）</summary>
+              <pre className="codeBlock">{benchmarkCsv}</pre>
+            </details>
+          ) : null}
         </div>
 
         <div className="gameLayout">
