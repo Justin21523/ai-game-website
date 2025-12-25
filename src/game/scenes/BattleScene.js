@@ -39,6 +39,7 @@ export const CONTROL_MODE = {
 const ROUND_PHASE = {
   FIGHT: 'fight',
   KO: 'ko',
+  DONE: 'done',
 }
 
 // BattleScene instances can be created/destroyed multiple times in development
@@ -170,6 +171,50 @@ export class BattleScene extends Phaser.Scene {
     this._koResumeAtMs = 0
     this._koPauseMs = 1500
 
+    // ---- Telemetry / benchmark (evaluation loop) ----
+    //
+    // Why:
+    // - When tuning AI and combat numbers, "it feels better" is not measurable.
+    // - A lightweight evaluation loop (run N rounds, collect stats) lets you:
+    //   - compare AI profiles objectively
+    //   - run regression checks after code changes
+    //   - learn by correlating BT decisions with outcomes
+    //
+    // This telemetry is intentionally simple and computed in BattleScene
+    // because it already owns hit resolution and round transitions.
+    this._telemetry = {
+      // Round start time (ms in Phaser clock).
+      roundStartedAtMs: 0,
+
+      // Per-round counters for both sides.
+      round: createEmptyRoundStats(),
+
+      // Edge detection: keep last-known state so we count *starts* not frames.
+      last: {
+        leftAttackRef: null,
+        rightAttackRef: null,
+        leftDashing: false,
+        rightDashing: false,
+        leftDodging: false,
+        rightDodging: false,
+      },
+    }
+
+    // Benchmark mode:
+    // - When enabled, we collect a per-round summary for a fixed number of rounds.
+    // - When complete, we can optionally pause the match and show a "finished" overlay.
+    this._benchmark = {
+      enabled: false,
+      stopOnComplete: true,
+      targetRounds: 0,
+      completedRounds: 0,
+      startedAtRound: 0,
+      startedAtMs: 0,
+      // Keep full per-round rows in memory; the UI can export them as JSON.
+      rounds: [],
+      report: null,
+    }
+
     // Time accumulator for throttled debug updates.
     this._debugAccumulatorMs = 0
 
@@ -286,6 +331,9 @@ export class BattleScene extends Phaser.Scene {
   resetMatch() {
     // Public API used by React UI: reset score + round and restart immediately.
     const nowMs = this.time?.now ?? 0
+
+    // Reset evaluation tooling too so the UI doesn't show stale numbers.
+    this.stopBenchmark()
 
     this._round = 1
     this._score = { leftWins: 0, rightWins: 0, draws: 0 }
@@ -445,6 +493,68 @@ export class BattleScene extends Phaser.Scene {
     const everyNRounds = Number.isFinite(rawEvery) ? Math.max(1, Math.min(20, Math.round(rawEvery))) : 1
 
     this._stageRotation = { enabled, everyNRounds }
+  }
+
+  startBenchmark({ rounds = 20, stopOnComplete = true, resetMatch = true } = {}) {
+    // Public API used by React UI:
+    // Start a short "evaluation run" that collects per-round stats.
+    //
+    // We keep this separate from normal gameplay so:
+    // - casual watching is unaffected
+    // - benchmark can be turned on/off quickly without rebuilding the scene
+    const desiredRounds = Number(rounds ?? 0)
+    const targetRounds = Number.isFinite(desiredRounds)
+      ? Math.max(1, Math.min(500, Math.round(desiredRounds)))
+      : 20
+
+    // Reset match first (optional) so benchmark starts from a clean state.
+    // IMPORTANT: resetMatch() would otherwise stop the benchmark if we enabled it first.
+    if (resetMatch) this.resetMatch()
+
+    const nowMs = this.time?.now ?? 0
+
+    this._benchmark.enabled = true
+    this._benchmark.stopOnComplete = Boolean(stopOnComplete)
+    this._benchmark.targetRounds = targetRounds
+    this._benchmark.completedRounds = 0
+    this._benchmark.startedAtRound = this._round
+    this._benchmark.startedAtMs = nowMs
+    this._benchmark.rounds = []
+    this._benchmark.report = null
+
+    // Always start a fresh round stats bucket for the next round.
+    this._telemetry.roundStartedAtMs = nowMs
+    this._telemetry.round = createEmptyRoundStats()
+    this._telemetry.round.roundNumber = this._round
+    this._telemetry.last.leftAttackRef = null
+    this._telemetry.last.rightAttackRef = null
+
+    if (this._log.enabled) {
+      this._log.info('benchmark:start', {
+        targetRounds,
+        stopOnComplete: this._benchmark.stopOnComplete,
+        resetMatch: Boolean(resetMatch),
+      })
+    }
+  }
+
+  stopBenchmark() {
+    // Public API used by React UI:
+    // Stop collecting benchmark stats but keep any already-collected rounds/report.
+    if (!this._benchmark) return
+
+    // Always disable collection (idempotent).
+    this._benchmark.enabled = false
+
+    // If we were in "DONE" phase, resume normal fight flow on next round reset.
+    // (We don't auto-reset here; the user can click "restart match" from React.)
+    if (this._roundPhase === ROUND_PHASE.DONE) {
+      this._roundPhase = ROUND_PHASE.FIGHT
+      this._setKoOverlayVisible(false)
+      this._koResumeAtMs = 0
+    }
+
+    if (this._log.enabled) this._log.info('benchmark:stop')
   }
 
   create() {
@@ -641,6 +751,14 @@ export class BattleScene extends Phaser.Scene {
     // Apply the default control mode after everything is created.
     // This also allows React to override the mode immediately after mounting.
     this.setControlMode(this._controlMode)
+
+    // Initialize telemetry for round 1.
+    // We treat the moment the scene finishes `create()` as the "round start".
+    const roundNowMs = this.time?.now ?? 0
+    this._telemetry.roundStartedAtMs = roundNowMs
+    this._telemetry.round = createEmptyRoundStats()
+    this._telemetry.round.startedAtMs = roundNowMs
+    this._telemetry.round.roundNumber = this._round
   }
 
   update(_time, delta) {
@@ -704,6 +822,16 @@ export class BattleScene extends Phaser.Scene {
         last.scrollY = cam.scrollY
         last.zoom = cam.zoom
       })
+    }
+
+    // If benchmark mode completed and asked to stop, we freeze the match here.
+    // This lets you read the result and export the report from the UI.
+    if (this._roundPhase === ROUND_PHASE.DONE) {
+      if (this._leftFighter?.body) this._leftFighter.body.setVelocity(0, 0)
+      if (this._rightFighter?.body) this._rightFighter.body.setVelocity(0, 0)
+
+      this._emitDebugSnapshot({ delta })
+      return
     }
 
     // If we are in KO pause, freeze the action and wait before restarting the round.
@@ -784,6 +912,9 @@ export class BattleScene extends Phaser.Scene {
     // Update fighters (movement + attack state machine) every frame for smooth physics.
     this._leftFighter.updateFighter({ nowMs, opponent: this._rightFighter })
     this._rightFighter.updateFighter({ nowMs, opponent: this._leftFighter })
+
+    // Update telemetry *after* fighters update so we can detect action starts that happened this frame.
+    this._updateTelemetryPerFrame({ nowMs })
 
     // Optional in-canvas debug drawing (hurtboxes/hitboxes/platforms).
     // Draw after fighters update so positions/state are current.
@@ -991,6 +1122,59 @@ export class BattleScene extends Phaser.Scene {
     }
   }
 
+  _updateTelemetryPerFrame({ nowMs }) {
+    // Per-frame telemetry sampling.
+    //
+    // We intentionally keep this:
+    // - edge-triggered (count starts, not frames)
+    // - cheap (only a handful of boolean checks)
+    //
+    // This runs only during the FIGHT phase.
+    const t = this._telemetry
+    if (!t) return
+
+    const left = this._leftFighter
+    const right = this._rightFighter
+    if (!left || !right) return
+
+    // ---- Attack start detection ----
+    // Fighter creates a new attack object when a move starts, and mutates it across phases.
+    // That means we can detect "attack started" by checking object identity changes.
+    const leftAttack = left.attackState
+    if (leftAttack && t.last.leftAttackRef !== leftAttack) {
+      t.round.left.attacksStarted += 1
+      t.last.leftAttackRef = leftAttack
+    } else if (!leftAttack) {
+      t.last.leftAttackRef = null
+    }
+
+    const rightAttack = right.attackState
+    if (rightAttack && t.last.rightAttackRef !== rightAttack) {
+      t.round.right.attacksStarted += 1
+      t.last.rightAttackRef = rightAttack
+    } else if (!rightAttack) {
+      t.last.rightAttackRef = null
+    }
+
+    // ---- Dash / Dodge start detection ----
+    // These are implemented as time windows in Fighter, so we detect "start" via rising edges.
+    const leftDashingNow = typeof left.isDashing === 'function' ? left.isDashing(nowMs) : false
+    if (leftDashingNow && !t.last.leftDashing) t.round.left.dashes += 1
+    t.last.leftDashing = leftDashingNow
+
+    const rightDashingNow = typeof right.isDashing === 'function' ? right.isDashing(nowMs) : false
+    if (rightDashingNow && !t.last.rightDashing) t.round.right.dashes += 1
+    t.last.rightDashing = rightDashingNow
+
+    const leftDodgingNow = typeof left.isDodging === 'function' ? left.isDodging(nowMs) : false
+    if (leftDodgingNow && !t.last.leftDodging) t.round.left.dodgesStarted += 1
+    t.last.leftDodging = leftDodgingNow
+
+    const rightDodgingNow = typeof right.isDodging === 'function' ? right.isDodging(nowMs) : false
+    if (rightDodgingNow && !t.last.rightDodging) t.round.right.dodgesStarted += 1
+    t.last.rightDodging = rightDodgingNow
+  }
+
   _resolveHit({ attacker, defender, nowMs }) {
     // Only check hits if the attacker currently has an active hitbox.
     const hitbox = attacker.getAttackHitboxRect()
@@ -1003,6 +1187,13 @@ export class BattleScene extends Phaser.Scene {
     const move = MOVES[attacker.attackState?.kind]
     if (!move) return
 
+    // Resolve sides for telemetry (left/right).
+    // This is used only for benchmark stats and has no gameplay effect.
+    const attackerSide =
+      attacker === this._leftFighter ? 'left' : attacker === this._rightFighter ? 'right' : null
+    const defenderSide =
+      defender === this._leftFighter ? 'left' : defender === this._rightFighter ? 'right' : null
+
     // Defensive mechanics (dodge / guard) are resolved here because:
     // - We have access to BOTH attacker and defender positions/facing.
     // - The fighter entity does not know who hit it, only that it got hit.
@@ -1011,6 +1202,11 @@ export class BattleScene extends Phaser.Scene {
     // We intentionally do NOT mark the attack as "hit" so it can still connect
     // later in the same active window if the defender becomes vulnerable again.
     if (typeof defender?.isInvincible === 'function' && defender.isInvincible(nowMs)) {
+      // Telemetry: count a "successful dodge" (i-frames avoided a hit).
+      if (this._telemetry && defenderSide) {
+        this._telemetry.round[defenderSide].dodges += 1
+        if (attackerSide) this._telemetry.round[attackerSide].hitsDodged += 1
+      }
       return
     }
 
@@ -1034,6 +1230,13 @@ export class BattleScene extends Phaser.Scene {
       const blockstunMs = Math.round(move.hitstunMs * 0.55)
       const pushbackX = Math.round(move.knockbackX * 0.45)
 
+      // Telemetry: count block (damage is recorded after applying to avoid overcount on KO).
+      if (this._telemetry && attackerSide && defenderSide) {
+        this._telemetry.round[defenderSide].blocks += 1
+        this._telemetry.round[attackerSide].hitsBlocked += 1
+      }
+
+      const hpBefore = defender.hp
       defender.takeHit({
         damage: chipDamage,
         knockbackX: pushbackX,
@@ -1044,6 +1247,14 @@ export class BattleScene extends Phaser.Scene {
         nowMs,
         impactKind: 'block',
       })
+
+      // Telemetry: record actual damage dealt (chip).
+      if (this._telemetry && attackerSide && defenderSide) {
+        const hpAfter = defender.hp
+        const actualDamage = Math.max(0, Number(hpBefore ?? 0) - Number(hpAfter ?? 0))
+        this._telemetry.round[attackerSide].damageDealt += actualDamage
+        this._telemetry.round[attackerSide].chipDamageDealt += actualDamage
+      }
 
       // Optional: small attacker recoil for readability (feels more like a fighting game).
       if (attacker?.body) {
@@ -1056,6 +1267,12 @@ export class BattleScene extends Phaser.Scene {
     // Unblocked hit: mark hit and apply full damage/knockback.
     attacker.markAttackHit()
 
+    // Telemetry: count a landed hit (damage is recorded after applying to avoid overcount on KO).
+    if (this._telemetry && attackerSide && defenderSide) {
+      this._telemetry.round[attackerSide].hitsLanded += 1
+    }
+
+    const hpBefore = defender.hp
     defender.takeHit({
       damage: move.damage,
       knockbackX: move.knockbackX,
@@ -1066,6 +1283,13 @@ export class BattleScene extends Phaser.Scene {
       nowMs,
       impactKind: 'hit',
     })
+
+    // Telemetry: record actual damage dealt (may be less than move.damage when HP was low).
+    if (this._telemetry && attackerSide && defenderSide) {
+      const hpAfter = defender.hp
+      const actualDamage = Math.max(0, Number(hpBefore ?? 0) - Number(hpAfter ?? 0))
+      this._telemetry.round[attackerSide].damageDealt += actualDamage
+    }
   }
 
   _resetFighters({ nowMs }) {
@@ -1089,6 +1313,49 @@ export class BattleScene extends Phaser.Scene {
     // If a side is using replay, restart playback each round.
     if (this._leftReplay) this._leftReplay.reset()
     if (this._rightReplay) this._rightReplay.reset()
+
+    // Start a fresh telemetry bucket for the new round.
+    // We do this here (instead of in update) so resets are deterministic and easy to reason about.
+    if (this._telemetry) {
+      this._telemetry.roundStartedAtMs = nowMs ?? 0
+      this._telemetry.round = createEmptyRoundStats()
+      this._telemetry.round.startedAtMs = nowMs ?? 0
+      this._telemetry.round.roundNumber = this._round
+
+      // Clear edge detection so the first actions of the round are counted correctly.
+      this._telemetry.last.leftAttackRef = null
+      this._telemetry.last.rightAttackRef = null
+      this._telemetry.last.leftDashing = false
+      this._telemetry.last.rightDashing = false
+      this._telemetry.last.leftDodging = false
+      this._telemetry.last.rightDodging = false
+    }
+  }
+
+  _finalizeRoundTelemetry({ nowMs, winner }) {
+    // Finalize the current round stats bucket.
+    // This is called exactly once per round (when KO triggers).
+    const t = this._telemetry
+    if (!t) return null
+
+    const round = t.round
+    if (!round) return null
+
+    round.endedAtMs = nowMs ?? 0
+    const startedAtMs = Number(round.startedAtMs ?? t.roundStartedAtMs ?? 0)
+    round.durationMs = Math.max(0, Number(round.endedAtMs ?? 0) - startedAtMs)
+
+    round.winner = winner ?? null
+    round.leftHpEnd = this._leftFighter?.hp ?? null
+    round.rightHpEnd = this._rightFighter?.hp ?? null
+
+    // Store a small stage identifier so benchmark rows are reproducible.
+    round.stage = {
+      style: this._stageMeta?.style ?? null,
+      seed: this._stageMeta?.seed ?? null,
+    }
+
+    return round
   }
 
   _beginKoPause({ nowMs }) {
@@ -1105,6 +1372,19 @@ export class BattleScene extends Phaser.Scene {
     else if (rightDead) winner = 'left'
 
     this._koWinner = winner
+
+    // Telemetry: finish the round stats now that we know the winner.
+    // We do this here so the numbers reflect the exact KO frame.
+    const finishedRound = this._finalizeRoundTelemetry({ nowMs, winner })
+
+    // Benchmark collection: store a copy of the finalized round row.
+    // We store *copies* so later resets cannot mutate historical results.
+    if (this._benchmark?.enabled && finishedRound) {
+      const row = exportRoundStats(finishedRound)
+      this._benchmark.rounds.push(row)
+      this._benchmark.completedRounds = this._benchmark.rounds.length
+      this._benchmark.report = computeBenchmarkReport(this._benchmark.rounds)
+    }
 
     // Update score immediately so it is visible during the KO pause.
     if (winner === 'draw') this._score.draws += 1
@@ -1152,6 +1432,44 @@ export class BattleScene extends Phaser.Scene {
 
     // When the pause ends, start the next round immediately.
     if (nowMs < this._koResumeAtMs) return
+
+    // If benchmark mode is running and we reached the target, freeze on the KO screen.
+    // This is the "evaluation loop" end condition.
+    const benchmarkDone =
+      Boolean(this._benchmark?.enabled) &&
+      Boolean(this._benchmark?.stopOnComplete) &&
+      Number(this._benchmark?.targetRounds ?? 0) > 0 &&
+      Number(this._benchmark?.completedRounds ?? 0) >= Number(this._benchmark?.targetRounds ?? 0)
+
+    if (benchmarkDone) {
+      // Stop collecting so the UI can treat the run as complete.
+      this._benchmark.enabled = false
+
+      // Switch to DONE phase to freeze the match in update().
+      this._roundPhase = ROUND_PHASE.DONE
+
+      // Replace KO overlay with a benchmark completion message.
+      if (this._koText) this._koText.setText('FINISH')
+      if (this._koSubText) {
+        const report = this._benchmark.report
+        const avgKoSec = report?.avgKoTimeMs ? Math.round(report.avgKoTimeMs / 100) / 10 : null
+        const leftWins = report?.wins?.left ?? 0
+        const rightWins = report?.wins?.right ?? 0
+        const draws = report?.wins?.draw ?? 0
+        this._koSubText.setText(
+          `Benchmark 完成：${this._benchmark.completedRounds}/${this._benchmark.targetRounds} 回合  ` +
+            `|  勝率 L:${leftWins} R:${rightWins} D:${draws}` +
+            (avgKoSec != null ? `  |  平均 KO ${avgKoSec}s` : ''),
+        )
+      }
+
+      // Keep overlay visible.
+      this._setKoOverlayVisible(true)
+
+      // Clear KO timer so we don't re-enter this branch repeatedly.
+      this._koResumeAtMs = 0
+      return
+    }
 
     // Hide overlay and reset KO state.
     this._setKoOverlayVisible(false)
@@ -1351,6 +1669,54 @@ export class BattleScene extends Phaser.Scene {
       roundPhase: this._roundPhase,
       koWinner: this._koWinner,
       failsafe: this._failsafe,
+      // Telemetry / benchmark: used for AI tuning and regression testing.
+      telemetry: this._telemetry?.round
+        ? {
+            roundNumber: Number(this._telemetry.round.roundNumber ?? this._round),
+            elapsedMs: Math.max(
+              0,
+              nowMs - Number(this._telemetry.round.startedAtMs ?? this._telemetry.roundStartedAtMs ?? 0),
+            ),
+            left: {
+              attacksStarted: this._telemetry.round.left.attacksStarted,
+              hitsLanded: this._telemetry.round.left.hitsLanded,
+              hitsBlocked: this._telemetry.round.left.hitsBlocked,
+              hitsDodged: this._telemetry.round.left.hitsDodged,
+              damageDealt: this._telemetry.round.left.damageDealt,
+              chipDamageDealt: this._telemetry.round.left.chipDamageDealt,
+              blocks: this._telemetry.round.left.blocks,
+              dodges: this._telemetry.round.left.dodges,
+              dashes: this._telemetry.round.left.dashes,
+              dodgesStarted: this._telemetry.round.left.dodgesStarted,
+            },
+            right: {
+              attacksStarted: this._telemetry.round.right.attacksStarted,
+              hitsLanded: this._telemetry.round.right.hitsLanded,
+              hitsBlocked: this._telemetry.round.right.hitsBlocked,
+              hitsDodged: this._telemetry.round.right.hitsDodged,
+              damageDealt: this._telemetry.round.right.damageDealt,
+              chipDamageDealt: this._telemetry.round.right.chipDamageDealt,
+              blocks: this._telemetry.round.right.blocks,
+              dodges: this._telemetry.round.right.dodges,
+              dashes: this._telemetry.round.right.dashes,
+              dodgesStarted: this._telemetry.round.right.dodgesStarted,
+            },
+          }
+        : null,
+      benchmark: this._benchmark
+        ? {
+            // `active` means we are currently collecting new rounds.
+            active: Boolean(this._benchmark.enabled),
+            stopOnComplete: Boolean(this._benchmark.stopOnComplete),
+            targetRounds: Number(this._benchmark.targetRounds ?? 0),
+            completedRounds: Number(this._benchmark.completedRounds ?? 0),
+            // `done` means we reached the target at least once (even if active is now false).
+            done:
+              Number(this._benchmark.targetRounds ?? 0) > 0 &&
+              Number(this._benchmark.completedRounds ?? 0) >= Number(this._benchmark.targetRounds ?? 0),
+            report: this._benchmark.report,
+          }
+        : null,
       btLoaded: Boolean(this._initialBtJsonText),
       stage: this._stageMeta,
     })
@@ -2049,6 +2415,131 @@ export class BattleScene extends Phaser.Scene {
     // For now we keep the bottom CLOSED so fighters can never fall forever.
     // (We can switch to "open bottom + ring-out KO" later when recovery moves exist.)
     this.physics.world.setBounds(x, y, w, h, true, true, true, true)
+  }
+}
+
+function createEmptySideRoundStats() {
+  // Per-side counters for a single round.
+  // Keep these as simple integers so the report can be JSON-exported easily.
+  return {
+    // Offense
+    attacksStarted: 0,
+    hitsLanded: 0,
+    hitsBlocked: 0,
+    hitsDodged: 0,
+    damageDealt: 0,
+    chipDamageDealt: 0,
+
+    // Defense / mobility
+    blocks: 0,
+    dodges: 0,
+    dashes: 0,
+    dodgesStarted: 0,
+  }
+}
+
+function createEmptyRoundStats() {
+  // A round row that we can finalize and export.
+  // This is kept small so storing hundreds of rounds is still cheap.
+  return {
+    roundNumber: 0,
+    startedAtMs: 0,
+    endedAtMs: 0,
+    durationMs: 0,
+    winner: null,
+    leftHpEnd: null,
+    rightHpEnd: null,
+    stage: { style: null, seed: null },
+    left: createEmptySideRoundStats(),
+    right: createEmptySideRoundStats(),
+  }
+}
+
+function exportRoundStats(round) {
+  // Return a deep-ish copy with only plain JSON values.
+  // This prevents later mutation when the scene resets internal objects.
+  return {
+    roundNumber: Number(round?.roundNumber ?? 0),
+    startedAtMs: Number(round?.startedAtMs ?? 0),
+    endedAtMs: Number(round?.endedAtMs ?? 0),
+    durationMs: Number(round?.durationMs ?? 0),
+    winner: round?.winner ?? null,
+    leftHpEnd: round?.leftHpEnd ?? null,
+    rightHpEnd: round?.rightHpEnd ?? null,
+    stage: {
+      style: round?.stage?.style ?? null,
+      seed: round?.stage?.seed ?? null,
+    },
+    left: { ...(round?.left ?? createEmptySideRoundStats()) },
+    right: { ...(round?.right ?? createEmptySideRoundStats()) },
+  }
+}
+
+function computeBenchmarkReport(rounds) {
+  // Compute a compact aggregate report for the UI.
+  //
+  // We keep the report stable and deterministic:
+  // - No random sampling
+  // - All numeric values are finite or null
+  const list = Array.isArray(rounds) ? rounds : []
+  const total = list.length
+  if (!total) {
+    return {
+      totalRounds: 0,
+      wins: { left: 0, right: 0, draw: 0 },
+      avgKoTimeMs: null,
+      avgDamageDealt: { left: null, right: null },
+      avgAttacksStarted: { left: null, right: null },
+      avgHitsLanded: { left: null, right: null },
+      avgBlocks: { left: null, right: null },
+      avgDodges: { left: null, right: null },
+    }
+  }
+
+  let leftWins = 0
+  let rightWins = 0
+  let draws = 0
+
+  let sumDuration = 0
+  let sumLeftDamage = 0
+  let sumRightDamage = 0
+  let sumLeftAttacks = 0
+  let sumRightAttacks = 0
+  let sumLeftHits = 0
+  let sumRightHits = 0
+  let sumLeftBlocks = 0
+  let sumRightBlocks = 0
+  let sumLeftDodges = 0
+  let sumRightDodges = 0
+
+  for (const r of list) {
+    const winner = r?.winner
+    if (winner === 'left') leftWins += 1
+    else if (winner === 'right') rightWins += 1
+    else draws += 1
+
+    sumDuration += Number(r?.durationMs ?? 0)
+    sumLeftDamage += Number(r?.left?.damageDealt ?? 0)
+    sumRightDamage += Number(r?.right?.damageDealt ?? 0)
+    sumLeftAttacks += Number(r?.left?.attacksStarted ?? 0)
+    sumRightAttacks += Number(r?.right?.attacksStarted ?? 0)
+    sumLeftHits += Number(r?.left?.hitsLanded ?? 0)
+    sumRightHits += Number(r?.right?.hitsLanded ?? 0)
+    sumLeftBlocks += Number(r?.left?.blocks ?? 0)
+    sumRightBlocks += Number(r?.right?.blocks ?? 0)
+    sumLeftDodges += Number(r?.left?.dodges ?? 0)
+    sumRightDodges += Number(r?.right?.dodges ?? 0)
+  }
+
+  return {
+    totalRounds: total,
+    wins: { left: leftWins, right: rightWins, draw: draws },
+    avgKoTimeMs: sumDuration / total,
+    avgDamageDealt: { left: sumLeftDamage / total, right: sumRightDamage / total },
+    avgAttacksStarted: { left: sumLeftAttacks / total, right: sumRightAttacks / total },
+    avgHitsLanded: { left: sumLeftHits / total, right: sumRightHits / total },
+    avgBlocks: { left: sumLeftBlocks / total, right: sumRightBlocks / total },
+    avgDodges: { left: sumLeftDodges / total, right: sumRightDodges / total },
   }
 }
 
