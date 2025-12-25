@@ -13,7 +13,9 @@ export default function GameHost({
   restartToken,
   replayCommand,
   stageCommand,
+  benchmarkCommand,
   onReplayData,
+  onBenchmarkData,
   onDebugSnapshot,
 }) {
   // This div is where Phaser will inject its canvas element.
@@ -362,6 +364,69 @@ export default function GameHost({
       cancelled = true
     }
   }, [stageCommand])
+
+  useEffect(() => {
+    // Execute benchmark-related commands on the running BattleScene.
+    // Benchmark mode is used for AI tuning: run N rounds and collect stats.
+    if (!benchmarkCommand) return () => {}
+
+    let cancelled = false
+
+    function tryRunCommand() {
+      if (cancelled) return true
+
+      const game = gameRef.current
+      if (!game) return false
+
+      const scene = game.scene?.getScene?.('BattleScene')
+      if (!scene) return false
+
+      switch (benchmarkCommand.type) {
+        case 'startBenchmark': {
+          if (typeof scene.startBenchmark === 'function') {
+            scene.startBenchmark(benchmarkCommand.payload)
+          }
+          break
+        }
+        case 'stopBenchmark': {
+          if (typeof scene.stopBenchmark === 'function') {
+            scene.stopBenchmark()
+          }
+          break
+        }
+        case 'exportBenchmark': {
+          if (typeof scene.exportBenchmark === 'function') {
+            const data = scene.exportBenchmark()
+            if (data && typeof onBenchmarkData === 'function') onBenchmarkData(data)
+          }
+          break
+        }
+        default: {
+          break
+        }
+      }
+
+      return true
+    }
+
+    // Try immediately; if the scene isn't ready yet, retry briefly.
+    if (tryRunCommand()) return () => {}
+
+    let tries = 0
+    function rafLoop() {
+      if (cancelled) return
+      tries += 1
+      if (tryRunCommand()) return
+      if (tries >= 60) return
+      requestAnimationFrame(rafLoop)
+    }
+
+    requestAnimationFrame(rafLoop)
+
+    return () => {
+      cancelled = true
+    }
+  }, [benchmarkCommand, onBenchmarkData])
 
   useEffect(() => {
     // Optional debug: track container resizing and DOM mutations.

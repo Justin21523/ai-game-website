@@ -557,6 +557,32 @@ export class BattleScene extends Phaser.Scene {
     if (this._log.enabled) this._log.info('benchmark:stop')
   }
 
+  exportBenchmark() {
+    // Public API used by React UI:
+    // Export the current benchmark payload as plain JSON data.
+    //
+    // Notes:
+    // - This returns only data already collected in memory.
+    // - It does NOT start/stop the benchmark.
+    const nowMs = this.time?.now ?? 0
+    const b = this._benchmark
+    if (!b) return null
+
+    return {
+      exportedAtMs: nowMs,
+      config: {
+        stopOnComplete: Boolean(b.stopOnComplete),
+        targetRounds: Number(b.targetRounds ?? 0),
+        startedAtRound: Number(b.startedAtRound ?? 0),
+        startedAtMs: Number(b.startedAtMs ?? 0),
+      },
+      aiProfiles: { ...this._aiProfiles },
+      stage: this._stageMeta ? { ...this._stageMeta } : null,
+      rounds: Array.isArray(b.rounds) ? b.rounds.slice() : [],
+      report: b.report ?? null,
+    }
+  }
+
   create() {
     // React dev mode can create/destroy the Phaser game more than once.
     // Drop the debug callback on shutdown to avoid stale scenes still trying to talk to React.
