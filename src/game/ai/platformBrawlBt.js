@@ -661,7 +661,7 @@ function utilityAttack(ctx, params) {
   if (ctx.blackboard?.self?.inHitstun || ctx.blackboard?.self?.inHitstop) return BT_STATUS.FAILURE
 
   const profile = ctx.blackboard?.ai?.profile ?? {}
-  const mode = String(params?.mode ?? 'neutral')
+  const requestedMode = String(params?.mode ?? 'neutral')
 
   const onGround = Boolean(ctx.blackboard?.self?.onGround)
   const targetOnGround = Boolean(ctx.blackboard?.target?.onGround)
@@ -677,9 +677,27 @@ function utilityAttack(ctx, params) {
   const hasPlatformGraph = Boolean(ctx.stage?.platformGraph?.nodes?.length)
   if (hasPlatformGraph && absDy > 170) return BT_STATUS.FAILURE
 
-  // Combat hysteresis: keep one planned move for a short time to reduce jitter.
+  // Combat memory contains:
+  // - anti-jitter "planned move" lock
+  // - hit-confirm signals (combo window, last outcome)
   const combat = getCombatMemory(ctx)
-  const isLocked = nowMs < (combat.lockedUntilMs ?? 0) && combat.desiredMoveKind
+
+  // If we recently landed a hit, we enter a short "combo/chase" window.
+  // If our last move was blocked, we enter a short "safe pressure" window.
+  const lastOutcome = String(combat.lastAttackEvent?.outcome ?? '')
+  const inComboWindow = nowMs < Number(combat.comboWindowUntilMs ?? 0) && lastOutcome === 'hit'
+  const inBlockPressure = nowMs < Number(combat.blockPressureUntilMs ?? 0) && lastOutcome === 'blocked'
+
+  // Effective mode can be upgraded from neutral based on hit-confirm signals.
+  // This makes the AI feel smarter even with a small BT.
+  let mode = requestedMode
+  if (mode === 'neutral' && inComboWindow) mode = 'combo'
+  else if (mode === 'neutral' && inBlockPressure) mode = 'pressure'
+
+  // Combat hysteresis: keep one planned move for a short time to reduce jitter.
+  // Only reuse the plan when the mode matches (prevents "pressure lock" leaking into neutral).
+  const isLocked =
+    nowMs < (combat.lockedUntilMs ?? 0) && combat.desiredMoveKind && String(combat.mode ?? '') === mode
 
   // Target hurtbox approximation at the predicted location.
   const targetRect = getHurtboxRectAt({
@@ -689,10 +707,27 @@ function utilityAttack(ctx, params) {
     height: target.displayHeight,
   })
 
-  // Candidate move list depends on whether we are grounded.
+  // Candidate move list depends on:
+  // - ground/air availability
+  // - "mode" (combo prefers fast, pressure prefers safe)
   const candidates = onGround
-    ? ['jab', 'light', 'sweep', 'heavy', 'uppercut']
+    ? mode === 'pressure'
+      ? ['jab', 'light', 'sweep']
+      : ['jab', 'light', 'sweep', 'heavy', 'uppercut']
     : ['airKick', 'light']
+
+  // Combo preferences make follow-ups look intentional instead of random.
+  const comboCount = Number(combat.comboCount ?? 0)
+  const comboPreferences =
+    mode === 'combo' && onGround
+      ? dy < -55
+        ? ['uppercut', 'light', 'jab']
+        : comboCount <= 1
+          ? ['jab', 'light']
+          : comboCount === 2
+            ? ['sweep', 'heavy', 'light']
+            : ['heavy', 'uppercut', 'sweep']
+      : []
 
   // If we are locked, try to execute/approach for the planned move kind.
   if (isLocked) {
@@ -726,7 +761,7 @@ function utilityAttack(ctx, params) {
     const hitbox = getMoveHitboxRect({ move, x: self.x, y: self.y, facing })
     const inRange = Phaser.Geom.Rectangle.Overlaps(hitbox, targetRect)
 
-    const score = scoreMove({
+    let score = scoreMove({
       move,
       inRange,
       absDx,
@@ -736,6 +771,12 @@ function utilityAttack(ctx, params) {
       profile,
       mode,
     })
+
+    // Bias toward a "structured" follow-up during combos.
+    if (mode === 'combo' && comboPreferences.length) {
+      const idx = comboPreferences.indexOf(kind)
+      if (idx !== -1) score += (comboPreferences.length - idx) * 6
+    }
 
     if (!best || score > best.score) {
       best = { kind, score, inRange }
@@ -747,12 +788,14 @@ function utilityAttack(ctx, params) {
   // Commit to the chosen move briefly (anti-oscillation).
   combat.desiredMoveKind = best.kind
   combat.mode = mode
-  combat.lockedUntilMs = nowMs + 320
+  combat.lockedUntilMs = nowMs + (mode === 'combo' ? 240 : 320)
 
   // If in range, issue the attack immediately.
   if (best.inRange) {
     ctx.intent.attackPressed = best.kind
     if (ctx.reasons) ctx.reasons.push(`ATTACK_SELECT:${best.kind}`)
+    if (mode === 'combo' && ctx.reasons) ctx.reasons.push('HIT_CONFIRM_COMBO')
+    if (mode === 'pressure' && ctx.reasons) ctx.reasons.push('HIT_CONFIRM_PRESSURE')
     return BT_STATUS.SUCCESS
   }
 
@@ -805,9 +848,15 @@ function approachAndAttack(ctx, { kind, nowMs, onGround, predictedTarget, target
   // Dash in when far and grounded.
   // We avoid randomness; dashChance is treated as a "tendency" threshold.
   const dashChance = clampNumber(Number(profile?.dashChance ?? 0.3), 0, 1)
-  if (onGround && absDx > 220 && dashChance >= 0.28) {
+  const dashDistance = mode === 'combo' ? 140 : mode === 'pressure' ? 180 : 220
+  const dashThreshold = mode === 'combo' ? 0.18 : mode === 'pressure' ? 0.24 : 0.28
+  if (onGround && absDx > dashDistance && dashChance >= dashThreshold) {
     ctx.intent.dashPressed = true
-    if (ctx.reasons) ctx.reasons.push(mode === 'punish' ? 'DASH_PUNISH' : 'DASH_IN')
+    if (ctx.reasons) {
+      ctx.reasons.push(
+        mode === 'punish' ? 'DASH_PUNISH' : mode === 'combo' ? 'DASH_COMBO' : 'DASH_IN',
+      )
+    }
   }
 
   if (ctx.reasons) ctx.reasons.push(mode === 'punish' ? 'PUNISH_APPROACH' : 'APPROACH_FOR_ATTACK')
@@ -838,8 +887,10 @@ function scoreMove({ move, inRange, absDx, dy, onGround, targetOnGround, profile
   // Mode tweaks:
   // - punish: prefer higher reward (whiff punish) moves
   // - combo: prefer faster moves
+  // - pressure: prefer safer moves (shorter recovery)
   if (mode === 'punish') score += reward * 0.35
   if (mode === 'combo') score -= Number(move.startupMs ?? 0) * 0.03
+  if (mode === 'pressure') score -= Number(move.recoveryMs ?? 0) * 0.02
 
   // Tag-based bonuses (contextual).
   const tags = Array.isArray(move.tags) ? move.tags : []
@@ -893,7 +944,22 @@ function getCombatMemory(ctx) {
       lockedUntilMs: 0,
       mode: null,
       desiredMoveKind: null,
+      // Hit-confirm / combo info (populated by BotAgent).
+      lastAttackEvent: null,
+      lastProcessedAttackEventAtMs: 0,
+      lastLandedHitAtMs: 0,
+      comboWindowUntilMs: 0,
+      comboCount: 0,
+      blockPressureUntilMs: 0,
     }
+  } else {
+    // Backfill new fields on existing objects so older sessions don't crash.
+    if (ai.combat.comboWindowUntilMs == null) ai.combat.comboWindowUntilMs = 0
+    if (ai.combat.comboCount == null) ai.combat.comboCount = 0
+    if (ai.combat.blockPressureUntilMs == null) ai.combat.blockPressureUntilMs = 0
+    if (ai.combat.lastAttackEvent == null) ai.combat.lastAttackEvent = null
+    if (ai.combat.lastProcessedAttackEventAtMs == null) ai.combat.lastProcessedAttackEventAtMs = 0
+    if (ai.combat.lastLandedHitAtMs == null) ai.combat.lastLandedHitAtMs = 0
   }
 
   return ai.combat

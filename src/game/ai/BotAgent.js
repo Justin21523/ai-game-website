@@ -171,6 +171,61 @@ export class BotAgent {
     this.blackboard.ai.profileId = profile.id
     this.blackboard.ai.profile = profile
 
+    // ---- Hit-confirm / combo signals ----
+    //
+    // BattleScene records attack outcomes on the Fighter (hit vs blocked).
+    // We pull that into the blackboard so BT leaves can make "expert" decisions:
+    // - On hit: commit to a short combo / chase window
+    // - On block: apply safer pressure (or disengage, depending on profile)
+    const ai = this.blackboard.ai
+    if (!ai.combat) {
+      // Keep a stable shape so BT leaves can safely read/modify it.
+      ai.combat = {
+        lockedUntilMs: 0,
+        mode: null,
+        desiredMoveKind: null,
+        lastProcessedAttackEventAtMs: 0,
+        lastAttackEvent: null,
+        lastLandedHitAtMs: 0,
+        comboWindowUntilMs: 0,
+        comboCount: 0,
+        blockPressureUntilMs: 0,
+      }
+    }
+
+    const combat = ai.combat
+    const lastAttackEvent =
+      typeof self?.getLastAttackEvent === 'function' ? self.getLastAttackEvent() : null
+
+    const eventAtMs = Number(lastAttackEvent?.atMs ?? 0)
+    if (lastAttackEvent && eventAtMs > Number(combat.lastProcessedAttackEventAtMs ?? 0)) {
+      combat.lastProcessedAttackEventAtMs = eventAtMs
+      combat.lastAttackEvent = lastAttackEvent
+
+      const outcome = String(lastAttackEvent.outcome ?? '')
+
+      if (outcome === 'hit') {
+        // Combo counter resets if the last hit was too long ago.
+        const lastHitAtMs = Number(combat.lastLandedHitAtMs ?? 0)
+        const resetWindowMs = 900
+        const nextCount =
+          eventAtMs - lastHitAtMs > resetWindowMs ? 1 : Number(combat.comboCount ?? 0) + 1
+
+        combat.comboCount = clamp(nextCount, 0, 10)
+        combat.lastLandedHitAtMs = eventAtMs
+
+        // Combo window:
+        // - slightly longer than hitstun, so the AI can dash/chase into the next hit
+        const hitstunMs = Number(lastAttackEvent.hitstunMs ?? 0)
+        const windowMs = clamp(hitstunMs + 240, 220, 900)
+        combat.comboWindowUntilMs = eventAtMs + windowMs
+      } else if (outcome === 'blocked') {
+        // Blocked pressure window (short).
+        // The AI can choose a safer follow-up instead of committing to a slow punish.
+        combat.blockPressureUntilMs = eventAtMs + 280
+      }
+    }
+
     // Threat model:
     // Predict whether the opponent's current attack could hit us soon (150-250ms window).
     this.blackboard.ai.threat = computeThreat({

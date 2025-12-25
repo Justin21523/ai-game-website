@@ -55,6 +55,8 @@ function pickHeadline({ reasons }) {
 
   // Attacks (next priority)
   if (has('PUNISH')) return '懲罰：對手收招中，嘗試靠近並用高回報招式反擊。'
+  if (has('HIT_CONFIRM_COMBO')) return '連段：命中確認後，嘗試追加追擊/連段輸出。'
+  if (has('HIT_CONFIRM_PRESSURE')) return '壓制：對手擋下攻擊後，改用較安全的壓制選擇。'
   if (has('TARGET_IN_HITSTUN')) return '加壓：對手在硬直中，嘗試貼身追擊並追加輸出。'
   if (hasPrefix('ATTACK_SELECT:')) {
     const raw = reasons.find((r) => typeof r === 'string' && r.startsWith('ATTACK_SELECT:'))
@@ -82,6 +84,7 @@ function pickHeadline({ reasons }) {
   if (has('PUNISH_APPROACH')) return '追擊：對手收招中，嘗試靠近以便懲罰。'
   if (has('DASH_PUNISH')) return '追擊：用 Dash 加速接近，以把握懲罰窗口。'
   if (has('DASH_IN')) return '追擊：用 Dash 快速接近，進入可出招距離。'
+  if (has('DASH_COMBO')) return '追擊：命中後用 Dash 追擊，延長輸出窗口。'
   if (has('DASH_CHASE')) return '追擊：距離很遠，用 Dash 加速追上對手。'
   if (has('DASH_APPROACH')) return '追擊：距離偏遠，用 Dash 加速接近。'
   if (has('APPROACH_FOR_ATTACK')) return '接近：為了進入招式距離，先向對手靠近。'
